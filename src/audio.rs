@@ -15,14 +15,6 @@ struct FormatDef {
 
 static FORMATS: &[(&str, FormatDef)] = &[
     (
-        "wav",
-        FormatDef {
-            codec: "pcm_s16le",
-            container: "wav",
-            content_type: "audio/wav",
-        },
-    ),
-    (
         "mp3",
         FormatDef {
             codec: "libmp3lame",
@@ -54,6 +46,22 @@ static FORMATS: &[(&str, FormatDef)] = &[
             content_type: "audio/flac",
         },
     ),
+    (
+        "wav",
+        FormatDef {
+            codec: "pcm_s16le",
+            container: "wav",
+            content_type: "audio/wav",
+        },
+    ),
+    (
+        "pcm",
+        FormatDef {
+            codec: "pcm_s16le",
+            container: "raw",
+            content_type: "audio/pcm;rate=24000",
+        },
+    ),
 ];
 
 fn find_format(name: &str) -> Result<&'static FormatDef> {
@@ -83,10 +91,11 @@ pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
 pub fn encode(tensor: &Tensor, sample_rate: u32, format: &str) -> Result<Vec<u8>> {
     let fmt = find_format(format)?;
     let samples = tensor.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    if fmt.container == "wav" {
-        return encode_wav_manual(&samples, sample_rate);
+    match fmt.container {
+        "wav" => encode_wav_manual(&samples, sample_rate),
+        "raw" => encode_pcm_raw(&samples),
+        _ => encode_via_ffmpeg(&samples, sample_rate, fmt),
     }
-    encode_via_ffmpeg(&samples, sample_rate, fmt)
 }
 
 fn resolve_audio_bytes(path_str: &str) -> Result<Vec<u8>> {
@@ -372,15 +381,39 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
     Ok(result)
 }
 
+fn f32_to_i16_le(samples: &[f32]) -> Vec<u8> {
+    let max_val = samples
+        .iter()
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    let scale = if max_val > 1.0 {
+        32767.0 / max_val
+    } else {
+        32767.0
+    };
+    samples
+        .iter()
+        .flat_map(|&s| {
+            let v = (s * scale).round().clamp(-32768.0, 32767.0) as i16;
+            v.to_le_bytes()
+        })
+        .collect()
+}
+
+fn encode_pcm_raw(samples: &[f32]) -> Result<Vec<u8>> {
+    Ok(f32_to_i16_le(samples))
+}
+
 fn encode_wav_manual(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
-    let num_samples = samples.len();
-    let data_size = num_samples * 2;
+    let pcm = f32_to_i16_le(samples);
+    let data_size = pcm.len() as u32;
     let file_size = 36 + data_size;
 
-    let mut buf = Vec::with_capacity(44 + data_size);
+    let mut buf = Vec::with_capacity(44 + data_size as usize);
 
     buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(file_size as u32).to_le_bytes());
+    buf.extend_from_slice(&file_size.to_le_bytes());
     buf.extend_from_slice(b"WAVE");
 
     buf.extend_from_slice(b"fmt ");
@@ -394,23 +427,8 @@ fn encode_wav_manual(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     buf.extend_from_slice(&16u16.to_le_bytes());
 
     buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&(data_size as u32).to_le_bytes());
-
-    let max_val = samples
-        .iter()
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
-    let scale = if max_val > 1.0 {
-        32767.0 / max_val
-    } else {
-        32767.0
-    };
-
-    for &s in samples {
-        let v = (s * scale).round().clamp(-32768.0, 32767.0) as i16;
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    buf.extend_from_slice(&pcm);
 
     Ok(buf)
 }

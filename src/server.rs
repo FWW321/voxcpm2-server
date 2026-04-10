@@ -39,7 +39,7 @@ pub struct SpeechRequest {
 }
 
 fn default_response_format() -> Option<String> {
-    Some("wav".to_string())
+    Some("mp3".to_string())
 }
 fn default_inference_timesteps() -> Option<usize> {
     Some(10)
@@ -141,7 +141,7 @@ async fn speech_handler(
         return (status, body).into_response();
     }
 
-    let response_format = req.response_format.unwrap_or_else(|| "wav".to_string());
+    let response_format = req.response_format.unwrap_or_else(|| "mp3".to_string());
     if crate::audio::content_type(&response_format).is_err() {
         let (status, body) = error_response(
             StatusCode::BAD_REQUEST,
