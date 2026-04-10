@@ -69,8 +69,10 @@ pub fn get_audio_bytes_vec(path_str: &str) -> Result<Vec<u8>> {
         let bytes = std::fs::read(path)?;
         Ok(bytes)
     } else if path_str.starts_with("data:audio") && path_str.contains("base64,") {
-        let data: Vec<&str> = path_str.split("base64,").collect();
-        let data = data[1];
+        let parts: Vec<&str> = path_str.splitn(2, "base64,").collect();
+        let data = parts
+            .get(1)
+            .ok_or_else(|| anyhow!("invalid base64 audio data URI"))?;
         let decoded = BASE64_STANDARD.decode(data)?;
         Ok(decoded)
     } else {

@@ -19,7 +19,13 @@ pub fn get_device(device: Option<&candle_core::Device>) -> candle_core::Device {
         None => {
             #[cfg(feature = "cuda")]
             {
-                candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
+                match candle_core::Device::new_cuda(0) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("CUDA not available ({}), falling back to CPU", e);
+                        candle_core::Device::Cpu
+                    }
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {

@@ -75,14 +75,13 @@ impl NaiveAttention {
         })
     }
 
-    pub fn forward(
+    fn project_qkv(
         &self,
         xs: &Tensor,
         cos: Option<&Tensor>,
         sin: Option<&Tensor>,
-        attention_mask: Option<&Tensor>,
         tof32: bool,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, q_len, _) = xs.dims3()?;
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
@@ -103,9 +102,21 @@ impl NaiveAttention {
         } else {
             (query_states, key_states)
         };
+        Ok((query_states, key_states, value_states))
+    }
+
+    fn compute_attention(
+        &self,
+        query_states: &Tensor,
+        key_states: Tensor,
+        value_states: Tensor,
+        b_sz: usize,
+        q_len: usize,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
         let attn_output = eager_attention_forward(
-            &query_states,
+            query_states,
             &key_states,
             &value_states,
             Some(self.num_kv_groups),
@@ -114,6 +125,26 @@ impl NaiveAttention {
         )?;
         let attn_output = attn_output.reshape((b_sz, q_len, self.middle_size))?;
         Ok(attn_output.apply(&self.o_proj)?)
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        tof32: bool,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let (query_states, key_states, value_states) = self.project_qkv(xs, cos, sin, tof32)?;
+        self.compute_attention(
+            &query_states,
+            key_states,
+            value_states,
+            b_sz,
+            q_len,
+            attention_mask,
+        )
     }
 
     pub fn forward_with_cache(
@@ -125,25 +156,7 @@ impl NaiveAttention {
         tof32: bool,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
-        let query_states = query_states
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let (query_states, key_states) = if let Some(cos) = cos
-            && let Some(sin) = sin
-        {
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
-        } else {
-            (query_states, key_states)
-        };
+        let (query_states, key_states, value_states) = self.project_qkv(xs, cos, sin, tof32)?;
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
@@ -153,17 +166,14 @@ impl NaiveAttention {
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
-        let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-        let attn_output = eager_attention_forward(
+        self.compute_attention(
             &query_states,
-            &key_states,
-            &value_states,
-            Some(self.num_kv_groups),
+            key_states,
+            value_states,
+            b_sz,
+            q_len,
             attention_mask,
-            scale,
-        )?;
-        let attn_output = attn_output.reshape((b_sz, q_len, self.middle_size))?;
-        Ok(attn_output.apply(&self.o_proj)?)
+        )
     }
 
     pub fn clear_kv_cache(&mut self) {

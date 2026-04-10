@@ -30,7 +30,7 @@ impl MiniCPMLongRoPE {
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
         let rope_theta = cfg.rope_theta;
         let short_factor = cfg.rope_scaling.short_factor.clone();
-        let long_factor = cfg.rope_scaling.short_factor.clone();
+        let long_factor = cfg.rope_scaling.long_factor.clone();
         let original_max_position_embeddings = cfg.rope_scaling.original_max_position_embeddings;
         let max_position_embeddings = cfg.max_position_embeddings;
         let scale = max_position_embeddings as f64 / original_max_position_embeddings as f64;
@@ -322,7 +322,12 @@ impl MiniCPMModel {
         let input_embeds = match input_embeds.rank() {
             2 => input_embeds.unsqueeze(1)?,
             3 => input_embeds.clone(),
-            _ => return Err(anyhow!("MiniCPMModelinput_embeds illigal")),
+            _ => {
+                return Err(anyhow!(
+                    "MiniCPMModel input_embeds illegal rank: {}",
+                    input_embeds.rank()
+                ));
+            }
         };
         let (bs, seq_len, _) = input_embeds.dims3()?;
         let attention_mask: Option<Tensor> = {

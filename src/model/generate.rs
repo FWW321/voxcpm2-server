@@ -52,6 +52,8 @@ impl VoxCPM2Engine {
         let model_list = find_type_files(path, "bin")?;
         let vb_voxcpm = if model_list.is_empty() {
             let model_list = find_type_files(path, "safetensors")?;
+            // SAFETY: mmaped safetensors files are read-only and the files are not modified
+            // while the process is running. The model files are downloaded once and held open.
             unsafe { VarBuilder::from_mmaped_safetensors(&model_list, m_dtype, device)? }
         } else {
             let tensors = Self::load_tensors(path, "bin", device)?;
@@ -100,7 +102,7 @@ impl VoxCPM2Engine {
         info!("Registering voice preset: {}", name);
         let cache = self
             .voxcpm
-            .build_prompt_cache(prompt_text, prompt_wav_path)?;
+            .build_prompt_cache(&prompt_text, &prompt_wav_path)?;
         self.voice_cache.insert(name, cache);
         Ok(())
     }
@@ -139,10 +141,14 @@ impl VoxCPM2Engine {
                 })?
                 .clone();
             self.voxcpm
-                .generate_with_prompt_cache(text, cache, config)?
+                .generate_with_prompt_cache(&text, cache, config)?
         } else {
-            self.voxcpm
-                .generate(text, prompt_text, prompt_wav_path, config)?
+            self.voxcpm.generate(
+                &text,
+                prompt_text.as_deref(),
+                prompt_wav_path.as_deref(),
+                config,
+            )?
         };
 
         let wav_bytes = get_audio_wav_u8(&audio, self.out_sample_rate as u32)?;

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -8,7 +8,6 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
@@ -88,13 +87,16 @@ struct ErrorDetail {
     code: Option<String>,
 }
 
-fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorResponse>) {
+fn error_response(
+    status: StatusCode,
+    message: impl AsRef<str>,
+) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
         Json(ErrorResponse {
             error: ErrorDetail {
-                message: message.to_string(),
-                r#type: "invalid_request_error".to_string(),
+                message: message.as_ref().to_string(),
+                r#type: "invalid_request_error".into(),
                 code: None,
             },
         }),
@@ -102,7 +104,7 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorR
 }
 
 pub struct AppState {
-    pub engine: RwLock<VoxCPM2Engine>,
+    pub engine: Mutex<VoxCPM2Engine>,
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -131,7 +133,7 @@ async fn speech_handler(
     {
         let (status, body) = error_response(
             StatusCode::NOT_FOUND,
-            &format!(
+            format!(
                 "Model '{}' not found. Supported: {}",
                 model, SUPPORTED_MODEL
             ),
@@ -144,7 +146,7 @@ async fn speech_handler(
     {
         let (status, body) = error_response(
             StatusCode::BAD_REQUEST,
-            &format!(
+            format!(
                 "Unsupported response_format '{}'. Only 'wav' is supported.",
                 fmt
             ),
@@ -174,26 +176,50 @@ async fn speech_handler(
         control_instruction,
     );
 
-    let mut engine = state.engine.write().await;
-    match engine.generate(
-        req.input,
-        prompt_text,
-        prompt_wav_path,
-        control_instruction,
-        voice,
-        &config,
-    ) {
-        Ok(wav_bytes) => {
-            info!("TTS complete: {} bytes", wav_bytes.len());
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
-            (StatusCode::OK, headers, wav_bytes).into_response()
+    let state = Arc::clone(&state);
+    let input = req.input;
+    let result = tokio::task::spawn_blocking(move || -> Result<Response, anyhow::Error> {
+        let mut engine = state
+            .engine
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
+        match engine.generate(
+            input,
+            prompt_text,
+            prompt_wav_path,
+            control_instruction,
+            voice,
+            &config,
+        ) {
+            Ok(wav_bytes) => {
+                info!("TTS complete: {} bytes", wav_bytes.len());
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+                Ok((StatusCode::OK, headers, wav_bytes).into_response())
+            }
+            Err(e) => {
+                error!("TTS inference error: {:?}", e);
+                let (status, body) = error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Inference failed: {}", e),
+                );
+                Ok((status, body).into_response())
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            let (status, body) =
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e));
+            (status, body).into_response()
         }
         Err(e) => {
-            error!("TTS inference error: {:?}", e);
             let (status, body) = error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Inference failed: {}", e),
+                format!("Task join error: {}", e),
             );
             (status, body).into_response()
         }
@@ -219,17 +245,34 @@ async fn register_voice_handler(
 
     info!("Registering voice: name='{}'", req.name);
 
-    let mut engine = state.engine.write().await;
-    match engine.register_voice(req.name, req.prompt_text, req.prompt_wav_url) {
-        Ok(()) => {
+    let state = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut engine = state
+            .engine
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
+        engine.register_voice(req.name, req.prompt_text, req.prompt_wav_url)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
             info!("Voice registered successfully");
             (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Voice registration error: {:?}", e);
             let (status, body) = error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to register voice: {}", e),
+                format!("Failed to register voice: {}", e),
+            );
+            (status, body).into_response()
+        }
+        Err(e) => {
+            error!("Voice registration task error: {:?}", e);
+            let (status, body) = error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Task join error: {}", e),
             );
             (status, body).into_response()
         }
@@ -237,7 +280,7 @@ async fn register_voice_handler(
 }
 
 async fn list_voices_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let engine = state.engine.read().await;
+    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let voices: Vec<&String> = engine.list_voices();
     Json(serde_json::json!({
         "voices": voices,
@@ -248,34 +291,32 @@ async fn delete_voice_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let mut engine = state.engine.write().await;
+    let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     if engine.remove_voice(&name) {
         info!("Voice deleted: {}", name);
         (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
     } else {
-        let (status, body) = error_response(
-            StatusCode::NOT_FOUND,
-            &format!("Voice '{}' not found", name),
-        );
+        let (status, body) =
+            error_response(StatusCode::NOT_FOUND, format!("Voice '{}' not found", name));
         (status, body).into_response()
     }
 }
 
 async fn models_handler() -> impl IntoResponse {
     let response = ModelsResponse {
-        object: "list".to_string(),
+        object: "list".into(),
         data: vec![ModelObject {
-            id: SUPPORTED_MODEL.to_string(),
-            object: "model".to_string(),
+            id: SUPPORTED_MODEL.into(),
+            object: "model".into(),
             created: 0,
-            owned_by: "openbmb".to_string(),
+            owned_by: "openbmb".into(),
         }],
     };
     Json(response)
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let engine = state.engine.read().await;
+    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let sample_rate = engine.sample_rate();
     let voice_count = engine.list_voices().len();
     Json(serde_json::json!({

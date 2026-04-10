@@ -56,7 +56,10 @@ pub struct SinusoidalPosEmb {
 
 impl SinusoidalPosEmb {
     pub fn new(dim: usize) -> Result<Self> {
-        assert_eq!(dim % 2, 0, "SinusoidalPosEmb requires dim to be even");
+        anyhow::ensure!(
+            dim.is_multiple_of(2),
+            "SinusoidalPosEmb requires dim to be even"
+        );
         Ok(Self { dim })
     }
     pub fn forward(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
@@ -138,7 +141,7 @@ impl VoxCPMLocDiT {
             config.hidden_size,
             None,
         )?;
-        assert_eq!(config.vocab_size, 0, "vocab_size must be 0 for local DiT");
+        anyhow::ensure!(config.vocab_size == 0, "vocab_size must be 0 for local DiT");
         let decoder = MiniCPMModel::new(vb.pp("decoder"), config.clone())?;
         Ok(Self {
             in_proj,
@@ -323,8 +326,8 @@ impl VoxCPMLocEnc {
     pub fn new(vb: VarBuilder, config: VoxMiniCPM4Config, input_dim: usize) -> Result<Self> {
         let special_token = vb.get((1, 1, 1, config.hidden_size), "special_token")?;
         let in_proj = linear(input_dim, config.hidden_size, vb.pp("in_proj"))?;
-        assert_eq!(
-            config.vocab_size, 0,
+        anyhow::ensure!(
+            config.vocab_size == 0,
             "vocab_size must be 0 for local encoder"
         );
         let hidden_size = config.hidden_size;
@@ -482,21 +485,21 @@ impl VoxCPMModel {
 
     pub fn generate(
         &mut self,
-        target_text: String,
-        prompt_text: Option<String>,
-        prompt_wav_path: Option<String>,
+        target_text: &str,
+        prompt_text: Option<&str>,
+        prompt_wav_path: Option<&str>,
         config: &InferenceConfig,
     ) -> Result<Tensor> {
         let (text_token, text_mask, audio_feat, audio_mask) = if let Some(prompt_text) = prompt_text
             && let Some(path) = prompt_wav_path
         {
-            let text = prompt_text + &target_text;
-            let text_token = self.tokenizer.encode(text)?;
+            let text = format!("{prompt_text}{target_text}");
+            let text_token = self.tokenizer.encode(&text)?;
             let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
             let audio_start = Tensor::new(vec![self.audio_start_token], &self.device)?;
             let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
             let text_length = text_token.dim(0)?;
-            let mut audio = load_audio_with_resample(&path, &self.device, Some(self.sample_rate))?;
+            let mut audio = load_audio_with_resample(path, &self.device, Some(self.sample_rate))?;
             let patch_len = self.patch_size * self.chunk_size;
             if audio.dim(1)? % patch_len != 0 {
                 audio =
@@ -531,12 +534,12 @@ impl VoxCPMModel {
             )?;
             (text_token, text_mask, audio_feat, audio_mask)
         } else if let Some(path) = prompt_wav_path {
-            let text_token = self.tokenizer.encode(target_text.clone())?;
+            let text_token = self.tokenizer.encode(target_text)?;
             let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
             let audio_start = Tensor::new(vec![self.audio_start_token], &self.device)?;
             let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
             let text_length = text_token.dim(0)?;
-            let mut audio = load_audio_with_resample(&path, &self.device, Some(self.sample_rate))?;
+            let mut audio = load_audio_with_resample(path, &self.device, Some(self.sample_rate))?;
             let patch_len = self.patch_size * self.chunk_size;
             if audio.dim(1)? % patch_len != 0 {
                 audio =
@@ -596,7 +599,7 @@ impl VoxCPMModel {
             )?;
             (text_token, text_mask, audio_feat, audio_mask)
         } else {
-            let text_token = self.tokenizer.encode(target_text.clone())?;
+            let text_token = self.tokenizer.encode(target_text)?;
             let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
             let audio_start = Tensor::new(vec![self.audio_start_token], &self.device)?;
             let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
@@ -668,13 +671,12 @@ impl VoxCPMModel {
             1.0
         };
 
-        let text_embed = self
+        let embed_tokens = self
             .base_lm
             .embed_tokens
             .as_ref()
-            .unwrap()
-            .forward(text)?
-            .affine(scale_emb as f64, 0.0)?;
+            .ok_or_else(|| anyhow::anyhow!("embed_tokens not initialized"))?;
+        let text_embed = embed_tokens.forward(text)?.affine(scale_emb as f64, 0.0)?;
         let combined_embed = text_mask
             .unsqueeze(D::Minus1)?
             .broadcast_mul(&text_embed)?
@@ -761,13 +763,13 @@ impl VoxCPMModel {
 
     pub fn build_prompt_cache(
         &mut self,
-        prompt_text: String,
-        prompt_wav_path: String,
+        prompt_text: &str,
+        prompt_wav_path: &str,
     ) -> Result<PromptCache> {
         let text_token = self.tokenizer.encode(prompt_text)?;
         let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
         let mut audio =
-            load_audio_with_resample(&prompt_wav_path, &self.device, Some(self.sample_rate))?;
+            load_audio_with_resample(prompt_wav_path, &self.device, Some(self.sample_rate))?;
         let patch_len = self.patch_size * self.chunk_size;
         if audio.dim(1)? % patch_len != 0 {
             audio = audio.pad_with_zeros(D::Minus1, 0, patch_len - audio.dim(1)? % patch_len)?;
@@ -786,11 +788,11 @@ impl VoxCPMModel {
 
     pub fn generate_with_prompt_cache(
         &mut self,
-        target_text: String,
+        target_text: &str,
         prompt_cache: PromptCache,
         config: &InferenceConfig,
     ) -> Result<Tensor> {
-        let target_text_token = self.tokenizer.encode(target_text.clone())?;
+        let target_text_token = self.tokenizer.encode(target_text)?;
         let target_text_token =
             Tensor::from_slice(&target_text_token, target_text_token.len(), &self.device)?;
         let text_token = match prompt_cache.get("text_token") {
@@ -805,7 +807,9 @@ impl VoxCPMModel {
             None => (0, None),
         };
         let (text_token, text_mask, audio_feat, audio_mask) = if audio_length > 0 {
-            let audio_feat = audio_feat.unwrap();
+            let Some(audio_feat) = audio_feat else {
+                anyhow::bail!("audio_feat missing from prompt_cache but audio_length > 0");
+            };
             let audio_length = audio_feat.dim(0)?;
             let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
             let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;

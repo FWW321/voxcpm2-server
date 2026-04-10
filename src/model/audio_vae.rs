@@ -687,7 +687,12 @@ impl AudioVAE {
             Some(r) => r,
             None => self.sample_rate,
         };
-        assert_eq!(sample_rate, self.sample_rate);
+        anyhow::ensure!(
+            sample_rate == self.sample_rate,
+            "sample_rate mismatch: expected {}, got {}",
+            self.sample_rate,
+            sample_rate
+        );
         let pad_to = self.hop_length;
         let length = audio_data.dim(D::Minus1)?;
         let right_pad = (length as f32 / pad_to as f32).ceil() as usize * pad_to - length;

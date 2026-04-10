@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{D, DType, Device, Tensor};
 
 pub fn linspace(start: f32, end: f32, steps: usize, device: &Device) -> Result<Tensor> {
-    assert!(steps > 0, "steps must be > 0");
+    anyhow::ensure!(steps > 0, "steps must be > 0");
     if steps == 1 {
         return Ok(Tensor::from_slice(&[start], 1, device)?);
     }

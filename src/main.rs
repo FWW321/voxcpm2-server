@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 
 use crate::model::generate::VoxCPM2Engine;
 use crate::server::{AppState, create_router};
@@ -54,35 +54,43 @@ fn missing_files(model_dir: &Path) -> Vec<&'static str> {
 
 fn download_file(url: &str, dest: &Path) -> Result<()> {
     use std::io::Write;
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        info!("Downloading {}", url);
-        let resp = reqwest::get(url).await?;
-        if !resp.status().is_success() {
-            bail!("Download failed: HTTP {}", resp.status());
-        }
-        let total = resp.content_length();
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::File::create(dest)?;
-        let mut downloaded: u64 = 0;
-        let mut stream = resp.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
-            if let Some(total) = total {
-                let pct = downloaded as f64 / total as f64 * 100.0;
-                let mb_dl = downloaded as f64 / 1_048_576.0;
-                let mb_total = total as f64 / 1_048_576.0;
-                eprint!("\r  {:.1}/{:.1} MB ({:.1}%)", mb_dl, mb_total, pct);
+    info!("Downloading {}", url);
+    let resp = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { reqwest::get(url).await })
+    })?;
+    if !resp.status().is_success() {
+        bail!("Download failed: HTTP {}", resp.status());
+    }
+    let total = resp.content_length();
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dest)?;
+    let mut downloaded: u64 = 0;
+    let body = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            use futures_util::StreamExt;
+            let mut buf = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                buf.extend_from_slice(&chunk);
             }
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        })
+    })?;
+    for chunk in body.chunks(8192) {
+        file.write_all(chunk)?;
+        downloaded += chunk.len() as u64;
+        if let Some(total) = total {
+            let pct = downloaded as f64 / total as f64 * 100.0;
+            let mb_dl = downloaded as f64 / 1_048_576.0;
+            let mb_total = total as f64 / 1_048_576.0;
+            eprint!("\r  {:.1}/{:.1} MB ({:.1}%)", mb_dl, mb_total, pct);
         }
-        println!();
-        Ok(())
-    })
+    }
+    println!();
+    Ok(())
 }
 
 fn ensure_model(model_dir: &Path) -> Result<()> {
@@ -111,7 +119,8 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     let args = Args::parse();
@@ -130,23 +139,55 @@ fn main() -> Result<()> {
     ensure_model(&model_path)?;
 
     info!("Loading VoxCPM2 model from: {}", model_path.display());
-    let engine = VoxCPM2Engine::init(model_path.to_str().unwrap_or_default(), None, None)?;
+    let model_str = model_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Model path contains non-UTF-8 characters"))?
+        .to_string();
+    let engine =
+        tokio::task::spawn_blocking(move || VoxCPM2Engine::init(&model_str, None, None)).await??;
     info!("Model loaded, sample_rate: {}", engine.sample_rate());
 
     let state = Arc::new(AppState {
-        engine: tokio::sync::RwLock::new(engine),
+        engine: std::sync::Mutex::new(engine),
     });
 
     let app = create_router(state);
     let addr = format!("{}:{}", args.host, args.port);
     info!("Starting server on {}", addr);
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        info!("Server listening on {}", addr);
-        axum::serve(listener, app).await
-    })?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("Server listening on {}", addr);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            warn!("failed to listen for ctrl+c");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                warn!("failed to listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down"),
+        _ = terminate => info!("Received SIGTERM, shutting down"),
+    }
 }

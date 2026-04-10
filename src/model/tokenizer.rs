@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Ok, Result, anyhow, bail};
 use tokenizers::Tokenizer;
 
 pub struct SingleChineseTokenizer {
@@ -9,15 +9,13 @@ pub struct SingleChineseTokenizer {
 impl SingleChineseTokenizer {
     pub fn new(path: &str) -> Result<Self> {
         let path = path.to_string();
-        assert!(
-            std::path::Path::new(&path).exists(),
-            "model path file not exists"
-        );
+        if !std::path::Path::new(&path).exists() {
+            bail!("model path does not exist: {}", path);
+        }
         let tokenizer_file = path.clone() + "/tokenizer.json";
-        assert!(
-            std::path::Path::new(&tokenizer_file).exists(),
-            "tokenizer.json not exists in model path"
-        );
+        if !std::path::Path::new(&tokenizer_file).exists() {
+            bail!("tokenizer.json not found in model path: {}", path);
+        }
         let tokenizer = Tokenizer::from_file(tokenizer_file)
             .map_err(|e| anyhow!(format!("tokenizer from file error{e}")))?;
         let mut multichar_tokens = Vec::new();
@@ -38,7 +36,7 @@ impl SingleChineseTokenizer {
             multichar_tokens,
         })
     }
-    pub fn encode(&self, text: String) -> Result<Vec<u32>> {
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encode = self
             .tokenizer
             .encode(text, false)

@@ -18,7 +18,7 @@ realfft = "3.5"
 rayon = "1.11"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -31,6 +31,9 @@ dirs = "6"
 
 [features]
 cuda = ["candle-nn/cuda", "candle-core/cuda", "candle-transformers/cuda"]
+
+[profile.release]
+lto = true
 
 [lints.clippy]
 needless_range_loop = "allow"
