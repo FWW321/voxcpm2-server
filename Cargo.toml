@@ -12,9 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tokenizers = "0.22"
-hound = "3.5"
-symphonia = { version = "0.5.5", features = ["mp3", "wav"] }
-realfft = "3.5"
+ffmpeg-next = "8.1.0"
+bytemuck = "1"
 rayon = "1.11"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["json"] }
@@ -28,6 +27,7 @@ base64 = "0.22"
 reqwest = { version = "0.13", features = ["stream"] }
 futures-util = "0.3"
 dirs = "6"
+tempfile = "3"
 
 [features]
 cuda = ["candle-nn/cuda", "candle-core/cuda", "candle-transformers/cuda"]
@@ -39,3 +39,4 @@ lto = true
 needless_range_loop = "allow"
 single_range_in_vec_init = "allow"
 manual_div_ceil = "allow"
+

@@ -1,10 +1,9 @@
 use anyhow::Result;
-use candle_core::{DType, Device, pickle::read_all_with_key};
+use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::audio::io::get_audio_wav_u8;
 use crate::model::{
     audio_vae::AudioVAE,
     config::{AudioVaeConfig, InferenceConfig, PromptCache, VoxCPMConfig},
@@ -77,7 +76,7 @@ impl VoxCPM2Engine {
         path: &str,
         extension: &str,
         _device: &Device,
-    ) -> Result<HashMap<String, candle_core::Tensor>> {
+    ) -> Result<HashMap<String, Tensor>> {
         let model_list = find_type_files(path, extension)?;
         let mut tensors = HashMap::new();
         for m in model_list {
@@ -123,7 +122,7 @@ impl VoxCPM2Engine {
         control_instruction: Option<String>,
         voice: Option<String>,
         config: &InferenceConfig,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Tensor> {
         let text = match control_instruction {
             Some(instr) => format!("({instr}){text}"),
             None => text,
@@ -151,8 +150,7 @@ impl VoxCPM2Engine {
             )?
         };
 
-        let wav_bytes = get_audio_wav_u8(&audio, self.out_sample_rate as u32)?;
         self.voxcpm.clear_kv_cache();
-        Ok(wav_bytes)
+        Ok(audio)
     }
 }

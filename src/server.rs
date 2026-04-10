@@ -141,15 +141,11 @@ async fn speech_handler(
         return (status, body).into_response();
     }
 
-    if let Some(ref fmt) = req.response_format
-        && fmt != "wav"
-    {
+    let response_format = req.response_format.unwrap_or_else(|| "wav".to_string());
+    if crate::audio::content_type(&response_format).is_err() {
         let (status, body) = error_response(
             StatusCode::BAD_REQUEST,
-            format!(
-                "Unsupported response_format '{}'. Only 'wav' is supported.",
-                fmt
-            ),
+            format!("Unsupported response_format '{}'", response_format),
         );
         return (status, body).into_response();
     }
@@ -168,9 +164,10 @@ async fn speech_handler(
 
     let input_preview: String = req.input.chars().take(50).collect();
     info!(
-        "TTS request: input='{}...', voice={:?}, prompt_text={:?}, has_ref_audio={}, control_instruction={:?}",
+        "TTS request: input='{}...', voice={:?}, format={}, prompt_text={:?}, has_ref_audio={}, control_instruction={:?}",
         input_preview,
         voice,
+        response_format,
         prompt_text,
         prompt_wav_path.is_some(),
         control_instruction,
@@ -183,29 +180,23 @@ async fn speech_handler(
             .engine
             .lock()
             .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
-        match engine.generate(
+        let audio_tensor = engine.generate(
             input,
             prompt_text,
             prompt_wav_path,
             control_instruction,
             voice,
             &config,
-        ) {
-            Ok(wav_bytes) => {
-                info!("TTS complete: {} bytes", wav_bytes.len());
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
-                Ok((StatusCode::OK, headers, wav_bytes).into_response())
-            }
-            Err(e) => {
-                error!("TTS inference error: {:?}", e);
-                let (status, body) = error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Inference failed: {}", e),
-                );
-                Ok((status, body).into_response())
-            }
-        }
+        )?;
+
+        let sr = engine.sample_rate() as u32;
+        let ct = crate::audio::content_type(&response_format)?;
+        let bytes = crate::audio::encode(&audio_tensor, sr, &response_format)?;
+        info!("TTS complete: {} bytes ({})", bytes.len(), response_format);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct)?);
+        Ok((StatusCode::OK, headers, bytes).into_response())
     })
     .await;
 
