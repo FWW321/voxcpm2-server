@@ -1,0 +1,152 @@
+mod audio;
+mod model;
+mod nn;
+mod server;
+mod utils;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Result, anyhow, bail};
+use clap::Parser;
+use tracing::{Level, info};
+
+use crate::model::generate::VoxCPM2Engine;
+use crate::server::{AppState, create_router};
+
+const MODEL_REPO: &str = "openbmb/VoxCPM2";
+const HF_BASE: &str = "https://huggingface.co";
+
+const REQUIRED_FILES: &[&str] = &[
+    "config.json",
+    "model.safetensors",
+    "audiovae.pth",
+    "tokenizer.json",
+];
+
+#[derive(Parser, Debug)]
+#[command(name = "voxcpm2-server", about = "VoxCPM2 TTS inference server")]
+struct Args {
+    #[arg(short, long, help = "Path to VoxCPM2 model directory")]
+    model: Option<String>,
+
+    #[arg(short, long, default_value = "0.0.0.0", help = "Host to bind")]
+    host: String,
+
+    #[arg(short, long, default_value_t = 5800, help = "Port to bind")]
+    port: u16,
+}
+
+fn default_model_dir() -> Result<PathBuf> {
+    let base = dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| anyhow!("Cannot determine local data directory"))?;
+    Ok(base.join("voxcpm2-server").join("model"))
+}
+
+fn missing_files(model_dir: &Path) -> Vec<&'static str> {
+    REQUIRED_FILES
+        .iter()
+        .filter(|f| !model_dir.join(f).exists())
+        .copied()
+        .collect()
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    use std::io::Write;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        info!("Downloading {}", url);
+        let resp = reqwest::get(url).await?;
+        if !resp.status().is_success() {
+            bail!("Download failed: HTTP {}", resp.status());
+        }
+        let total = resp.content_length();
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(dest)?;
+        let mut downloaded: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+            if let Some(total) = total {
+                let pct = downloaded as f64 / total as f64 * 100.0;
+                let mb_dl = downloaded as f64 / 1_048_576.0;
+                let mb_total = total as f64 / 1_048_576.0;
+                eprint!("\r  {:.1}/{:.1} MB ({:.1}%)", mb_dl, mb_total, pct);
+            }
+        }
+        println!();
+        Ok(())
+    })
+}
+
+fn ensure_model(model_dir: &Path) -> Result<()> {
+    let missing = missing_files(model_dir);
+    if missing.is_empty() {
+        info!("Model files found in {}", model_dir.display());
+        return Ok(());
+    }
+
+    info!("Missing model files: {:?}", missing);
+    info!("Downloading from HuggingFace ({})...", MODEL_REPO);
+
+    for file in &missing {
+        let url = format!("{}/{}/resolve/main/{}", HF_BASE, MODEL_REPO, file);
+        let dest = model_dir.join(file);
+        match download_file(&url, &dest) {
+            Ok(()) => info!("  ✓ {}", file),
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                bail!("Failed to download {}: {}", file, e);
+            }
+        }
+    }
+
+    info!("All model files downloaded to {}", model_dir.display());
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
+    let args = Args::parse();
+
+    let model_path = match &args.model {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let dir = default_model_dir()?;
+            if !dir.exists() {
+                info!("No --model specified, using default: {}", dir.display());
+            }
+            dir
+        }
+    };
+
+    ensure_model(&model_path)?;
+
+    info!("Loading VoxCPM2 model from: {}", model_path.display());
+    let engine = VoxCPM2Engine::init(model_path.to_str().unwrap_or_default(), None, None)?;
+    info!("Model loaded, sample_rate: {}", engine.sample_rate());
+
+    let state = Arc::new(AppState {
+        engine: tokio::sync::RwLock::new(engine),
+    });
+
+    let app = create_router(state);
+    let addr = format!("{}:{}", args.host, args.port);
+    info!("Starting server on {}", addr);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("Server listening on {}", addr);
+        axum::serve(listener, app).await
+    })?;
+
+    Ok(())
+}
