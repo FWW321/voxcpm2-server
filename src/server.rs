@@ -141,7 +141,7 @@ async fn speech_handler(
     }
 
     let response_format = req.response_format.unwrap_or_else(|| "mp3".to_string());
-    if crate::audio::content_type(&response_format).is_err() {
+    if crate::audio::content_type(&response_format, 24000).is_err() {
         let (status, body) = error_response(
             StatusCode::BAD_REQUEST,
             format!("Unsupported response_format '{}'", response_format),
@@ -200,12 +200,12 @@ async fn speech_handler(
         )?;
 
         let sr = engine.sample_rate() as u32;
-        let ct = crate::audio::content_type(&response_format)?;
+        let ct = crate::audio::content_type(&response_format, sr)?;
         let bytes = crate::audio::encode(&audio_tensor, sr, &response_format, speed)?;
         info!("TTS complete: {} bytes ({})", bytes.len(), response_format);
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct)?);
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct)?);
         Ok((StatusCode::OK, headers, bytes).into_response())
     })
     .await;

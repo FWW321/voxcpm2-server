@@ -10,7 +10,26 @@ use url::Url;
 struct FormatDef {
     codec: &'static str,
     container: &'static str,
-    content_type: &'static str,
+    content_type_fn: fn(u32) -> String,
+}
+
+fn content_type_mp3(_: u32) -> String {
+    "audio/mpeg".to_string()
+}
+fn content_type_opus(_: u32) -> String {
+    "audio/ogg; codecs=opus".to_string()
+}
+fn content_type_aac(_: u32) -> String {
+    "audio/aac".to_string()
+}
+fn content_type_flac(_: u32) -> String {
+    "audio/flac".to_string()
+}
+fn content_type_wav(_: u32) -> String {
+    "audio/wav".to_string()
+}
+fn content_type_pcm(sr: u32) -> String {
+    format!("audio/pcm;rate={sr}")
 }
 
 static FORMATS: &[(&str, FormatDef)] = &[
@@ -19,7 +38,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "libmp3lame",
             container: "mp3",
-            content_type: "audio/mpeg",
+            content_type_fn: content_type_mp3,
         },
     ),
     (
@@ -27,7 +46,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "libopus",
             container: "ogg",
-            content_type: "audio/ogg; codecs=opus",
+            content_type_fn: content_type_opus,
         },
     ),
     (
@@ -35,7 +54,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "aac",
             container: "adts",
-            content_type: "audio/aac",
+            content_type_fn: content_type_aac,
         },
     ),
     (
@@ -43,7 +62,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "flac",
             container: "flac",
-            content_type: "audio/flac",
+            content_type_fn: content_type_flac,
         },
     ),
     (
@@ -51,7 +70,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "pcm_s16le",
             container: "wav",
-            content_type: "audio/wav",
+            content_type_fn: content_type_wav,
         },
     ),
     (
@@ -59,7 +78,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "pcm_s16le",
             container: "raw",
-            content_type: "audio/pcm;rate=24000",
+            content_type_fn: content_type_pcm,
         },
     ),
 ];
@@ -79,8 +98,8 @@ fn find_format(name: &str) -> Result<&'static FormatDef> {
         })
 }
 
-pub fn content_type(format: &str) -> Result<&'static str> {
-    Ok(find_format(format)?.content_type)
+pub fn content_type(format: &str, sample_rate: u32) -> Result<String> {
+    Ok((find_format(format)?.content_type_fn)(sample_rate))
 }
 
 pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
@@ -134,20 +153,26 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
     graph.add(&abuffersink, "out", "")?;
 
     {
-        let mut in_ctx = graph.get("in").expect("in context");
-        let mut first = graph.get(&atempo_names[0]).expect("atempo0");
+        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
+        let mut first = graph
+            .get(&atempo_names[0])
+            .ok_or_else(|| anyhow!("atempo0 context"))?;
         in_ctx.link(0, &mut first, 0);
     }
     for i in 1..factors.len() {
-        let mut prev = graph.get(&atempo_names[i - 1]).expect("prev atempo");
-        let mut cur = graph.get(&atempo_names[i]).expect("cur atempo");
+        let mut prev = graph
+            .get(&atempo_names[i - 1])
+            .ok_or_else(|| anyhow!("atempo context"))?;
+        let mut cur = graph
+            .get(&atempo_names[i])
+            .ok_or_else(|| anyhow!("atempo context"))?;
         prev.link(0, &mut cur, 0);
     }
     {
         let mut last = graph
             .get(&atempo_names[factors.len() - 1])
-            .expect("last atempo");
-        let mut out_ctx = graph.get("out").expect("out context");
+            .ok_or_else(|| anyhow!("last atempo context"))?;
+        let mut out_ctx = graph.get("out").ok_or_else(|| anyhow!("out context"))?;
         last.link(0, &mut out_ctx, 0);
     }
 
@@ -168,7 +193,7 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
         data.copy_from_slice(chunk);
 
         {
-            let mut in_ctx = graph.get("in").expect("in context");
+            let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
             in_ctx.source().add(&frame)?;
         }
 
@@ -176,14 +201,14 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
     }
 
     {
-        let mut in_ctx = graph.get("in").expect("in context");
+        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
         in_ctx.source().flush()?;
     }
 
     let mut result = Vec::with_capacity(samples.len());
     loop {
         let mut out_frame = ffmpeg::util::frame::Audio::empty();
-        let mut out_ctx = graph.get("out").expect("out context");
+        let mut out_ctx = graph.get("out").ok_or_else(|| anyhow!("out context"))?;
         match out_ctx.sink().frame(&mut out_frame) {
             Ok(()) => {
                 result.extend_from_slice(out_frame.plane::<f32>(0));
@@ -314,13 +339,18 @@ fn decode_bytes(bytes: &[u8], device: &Device, target_sr: usize) -> Result<Tenso
     Ok(Tensor::from_vec(all_samples, (1, len), device)?)
 }
 
-fn drain_encoder(
-    encoder: &mut ffmpeg::codec::encoder::Audio,
-    octx: &mut ffmpeg::format::context::Output,
-) -> Result<()> {
+struct EncoderCtx<'a> {
+    encoder: &'a mut ffmpeg::codec::encoder::Audio,
+    octx: &'a mut ffmpeg::format::context::Output,
+    time_base: (i32, i32),
+}
+
+fn drain_encoder(ctx: &mut EncoderCtx) -> Result<()> {
     let mut pkt = ffmpeg::Packet::empty();
-    while encoder.receive_packet(&mut pkt).is_ok() {
-        pkt.write_interleaved(octx)?;
+    while ctx.encoder.receive_packet(&mut pkt).is_ok() {
+        pkt.set_stream(0);
+        pkt.rescale_ts(ctx.time_base, ctx.time_base);
+        pkt.write_interleaved(ctx.octx)?;
     }
     Ok(())
 }
@@ -331,21 +361,19 @@ fn send_audio_frame(
     layout: ffmpeg::channel_layout::ChannelLayout,
     channels: usize,
     frame_size: usize,
-    encoder: &mut ffmpeg::codec::encoder::Audio,
-    octx: &mut ffmpeg::format::context::Output,
+    ctx: &mut EncoderCtx,
 ) -> Result<()> {
+    let mut pts: i64 = 0;
     for chunk in f32_data.chunks(frame_size * channels) {
         let chunk_samples = chunk.len() / channels;
-        let mut frame = ffmpeg::util::frame::Audio::empty();
-        // SAFETY: ffmpeg frame alloc - format/layout/chunk_samples are valid
-        unsafe {
-            frame.alloc(format, chunk_samples, layout);
-        }
+        let mut frame = ffmpeg::util::frame::Audio::new(format, chunk_samples, layout);
         let dst = frame.data_mut(0);
         let src_bytes = bytemuck::cast_slice::<f32, u8>(chunk);
         dst[..src_bytes.len()].copy_from_slice(src_bytes);
-        encoder.send_frame(&frame)?;
-        drain_encoder(encoder, octx)?;
+        frame.set_pts(Some(pts));
+        pts += chunk_samples as i64;
+        ctx.encoder.send_frame(&frame)?;
+        drain_encoder(ctx)?;
     }
     Ok(())
 }
@@ -386,23 +414,24 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
         encoder.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
+    let time_base = (1, sample_rate as i32);
+
     let mut encoder = encoder.open_as(audio_codec)?;
     ostream.set_parameters(&encoder);
 
     let frame_size = encoder.frame_size().max(1) as usize;
 
     octx.write_header()?;
-    send_audio_frame(
-        samples,
-        enc_format,
-        layout,
-        1,
-        frame_size,
-        &mut encoder,
-        &mut octx,
-    )?;
-    encoder.send_eof()?;
-    drain_encoder(&mut encoder, &mut octx)?;
+    {
+        let mut ctx = EncoderCtx {
+            encoder: &mut encoder,
+            octx: &mut octx,
+            time_base,
+        };
+        send_audio_frame(samples, enc_format, layout, 1, frame_size, &mut ctx)?;
+        ctx.encoder.send_eof()?;
+        drain_encoder(&mut ctx)?;
+    }
     octx.write_trailer()?;
 
     let result = std::fs::read(tmp_out.path())?;
