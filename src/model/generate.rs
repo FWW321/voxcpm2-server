@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
+use candle_core::{pickle::read_all_with_key, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 use tracing::info;
@@ -121,11 +121,6 @@ impl VoxCPM2Engine {
 
     pub fn list_voices(&self) -> Vec<&String> {
         self.voice_cache.keys().collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn remove_voice(&mut self, name: &str) -> bool {
-        self.voice_cache.remove(name).is_some()
     }
 
     pub fn generate(&mut self, req: GenerateRequest) -> Result<Tensor> {
