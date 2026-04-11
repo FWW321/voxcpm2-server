@@ -28,29 +28,24 @@
         gcc
         pkg-config
         openssl
-        llvmPackages.libclang
-        ffmpeg.dev
         cudaPackages.cudatoolkit
         cudaPackages.cudnn
       ];
 
       runtimeDeps = with pkgs; [
         openssl.out
-        ffmpeg
       ];
 
       cudaLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
         cudaPackages.cudatoolkit.lib
         cudaPackages.cudnn.lib
         stdenv.cc.cc.lib
-        ffmpeg.lib
       ]) + ":/run/opengl-driver/lib";
 
       cudaLinkPath = pkgs.lib.makeLibraryPath [
         pkgs.cudaPackages.cudatoolkit.lib
         pkgs.cudaPackages.cudnn.lib
         "/run/opengl-driver"
-        pkgs.ffmpeg.lib
       ];
     in
     {
@@ -59,9 +54,7 @@
 
         LD_LIBRARY_PATH = cudaLibPath;
         LIBRARY_PATH = cudaLinkPath;
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        CPATH = "${pkgs.cudaPackages.cudatoolkit}/include:${pkgs.ffmpeg.dev}/include";
-        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+        CPATH = "${pkgs.cudaPackages.cudatoolkit}/include";
 
         shellHook = ''
           echo "voxcpm2-server dev shell"

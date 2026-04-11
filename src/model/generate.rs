@@ -18,6 +18,16 @@ pub struct VoxCPM2Engine {
     voice_cache: HashMap<String, PromptCache>,
 }
 
+pub struct GenerateRequest<'a> {
+    pub text: &'a str,
+    pub prompt_text: Option<&'a str>,
+    pub prompt_wav_path: Option<&'a str>,
+    pub reference_wav_path: Option<&'a str>,
+    pub control_instruction: Option<String>,
+    pub voice: Option<String>,
+    pub config: &'a InferenceConfig,
+}
+
 impl VoxCPM2Engine {
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let device = &get_device(device);
@@ -96,14 +106,15 @@ impl VoxCPM2Engine {
     pub fn register_voice(
         &mut self,
         name: impl Into<String>,
-        prompt_text: impl AsRef<str>,
-        prompt_wav_path: impl AsRef<str>,
+        prompt_text: Option<&str>,
+        prompt_wav_path: Option<&str>,
+        reference_wav_path: Option<&str>,
     ) -> Result<()> {
         let name = name.into();
         info!("Registering voice preset: {}", name);
         let cache = self
             .voxcpm
-            .build_prompt_cache(prompt_text.as_ref(), prompt_wav_path.as_ref())?;
+            .build_prompt_cache(prompt_text, prompt_wav_path.or(reference_wav_path))?;
         self.voice_cache.insert(name, cache);
         Ok(())
     }
@@ -116,21 +127,13 @@ impl VoxCPM2Engine {
         self.voice_cache.remove(name).is_some()
     }
 
-    pub fn generate(
-        &mut self,
-        text: &str,
-        prompt_text: Option<String>,
-        prompt_wav_path: Option<String>,
-        control_instruction: Option<String>,
-        voice: Option<String>,
-        config: &InferenceConfig,
-    ) -> Result<Tensor> {
-        let text = match control_instruction {
-            Some(instr) => format!("({instr}){text}"),
-            None => text.to_string(),
+    pub fn generate(&mut self, req: GenerateRequest) -> Result<Tensor> {
+        let text = match req.control_instruction {
+            Some(instr) => format!("({instr}){}", req.text),
+            None => req.text.to_string(),
         };
 
-        let audio = if let Some(voice_name) = voice {
+        let audio = if let Some(voice_name) = req.voice {
             let cache = self.voice_cache.get(&voice_name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "Voice preset '{}' not found. Register it first via POST /v1/audio/voices",
@@ -138,13 +141,14 @@ impl VoxCPM2Engine {
                 )
             })?;
             self.voxcpm
-                .generate_with_prompt_cache(&text, cache, config)?
+                .generate_with_prompt_cache(&text, cache, req.config)?
         } else {
             self.voxcpm.generate(
                 &text,
-                prompt_text.as_deref(),
-                prompt_wav_path.as_deref(),
-                config,
+                req.prompt_text,
+                req.prompt_wav_path,
+                req.reference_wav_path,
+                req.config,
             )?
         };
 

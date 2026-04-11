@@ -30,7 +30,7 @@ struct Args {
     #[arg(short, long, help = "Path to VoxCPM2 model directory")]
     model: Option<String>,
 
-    #[arg(short, long, default_value = "0.0.0.0", help = "Host to bind")]
+    #[arg(long, default_value = "0.0.0.0", help = "Host to bind")]
     host: String,
 
     #[arg(short, long, default_value_t = 5800, help = "Port to bind")]
@@ -122,7 +122,6 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    ffmpeg_next::init()?;
 
     let args = Args::parse();
 

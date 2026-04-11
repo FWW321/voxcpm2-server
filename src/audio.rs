@@ -1,509 +1,315 @@
-use std::borrow::Cow;
-use std::io::Write;
+use std::f64::consts::PI;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use candle_core::{DType, Device, Tensor};
-use ffmpeg_next as ffmpeg;
+use candle_core::{Device, Tensor};
+use candle_nn::Module;
+use hound::{SampleFormat, WavSpec, WavWriter};
+use num::integer::gcd;
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use url::Url;
 
-#[derive(Clone, Copy)]
-enum AudioContentType {
-    Mp3,
-    Opus,
-    Aac,
-    Flac,
-    Wav,
-    Pcm,
-}
+pub fn encode_wav(audio: &Tensor, sample_rate: u32) -> Result<Vec<u8>> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    assert_eq!(
+        audio.dim(0)?,
+        1,
+        "audio must be mono (1 channel), got {} channels",
+        audio.dim(0)?
+    );
 
-impl AudioContentType {
-    fn as_str(&self, sample_rate: u32) -> Cow<'static, str> {
-        match self {
-            AudioContentType::Mp3 => Cow::Borrowed("audio/mpeg"),
-            AudioContentType::Opus => Cow::Borrowed("audio/ogg; codecs=opus"),
-            AudioContentType::Aac => Cow::Borrowed("audio/aac"),
-            AudioContentType::Flac => Cow::Borrowed("audio/flac"),
-            AudioContentType::Wav => Cow::Borrowed("audio/wav"),
-            AudioContentType::Pcm => Cow::Owned(format!("audio/pcm;rate={sample_rate}")),
-        }
+    let max = audio
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()
+        .context("get max amplitude")?;
+    let ratio = if max > 1.0 { 32767.0 / max } else { 32767.0 };
+
+    let samples = audio.squeeze(0)?.to_vec1::<f32>()?;
+    let mut cursor = Cursor::new(Vec::with_capacity(samples.len() * 2 + 44));
+    let mut writer = WavWriter::new(&mut cursor, spec)?;
+    for &s in &samples {
+        writer.write_sample((s * ratio).round().clamp(-32768.0, 32767.0) as i16)?;
     }
-}
-
-struct FormatDef {
-    codec: &'static str,
-    container: &'static str,
-    content_type: AudioContentType,
-}
-
-static FORMATS: &[(&str, FormatDef)] = &[
-    (
-        "mp3",
-        FormatDef {
-            codec: "libmp3lame",
-            container: "mp3",
-            content_type: AudioContentType::Mp3,
-        },
-    ),
-    (
-        "opus",
-        FormatDef {
-            codec: "libopus",
-            container: "ogg",
-            content_type: AudioContentType::Opus,
-        },
-    ),
-    (
-        "aac",
-        FormatDef {
-            codec: "aac",
-            container: "adts",
-            content_type: AudioContentType::Aac,
-        },
-    ),
-    (
-        "flac",
-        FormatDef {
-            codec: "flac",
-            container: "flac",
-            content_type: AudioContentType::Flac,
-        },
-    ),
-    (
-        "wav",
-        FormatDef {
-            codec: "pcm_s16le",
-            container: "wav",
-            content_type: AudioContentType::Wav,
-        },
-    ),
-    (
-        "pcm",
-        FormatDef {
-            codec: "pcm_s16le",
-            container: "raw",
-            content_type: AudioContentType::Pcm,
-        },
-    ),
-];
-
-fn find_format(name: &str) -> Result<&'static FormatDef> {
-    FORMATS
-        .iter()
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v)
-        .ok_or_else(|| {
-            let supported: Vec<&str> = FORMATS.iter().map(|(k, _)| *k).collect();
-            anyhow!(
-                "Unsupported format '{}'. Supported: {}",
-                name,
-                supported.join(", ")
-            )
-        })
-}
-
-pub fn content_type(format: &str, sample_rate: u32) -> Result<Cow<'static, str>> {
-    Ok(find_format(format)?.content_type.as_str(sample_rate))
+    writer.finalize()?;
+    Ok(cursor.into_inner())
 }
 
 pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
-    let bytes = resolve_audio_bytes(path)?;
-    decode_bytes(&bytes, device, target_sr)
-}
-
-pub fn encode(
-    tensor: &Tensor,
-    sample_rate: u32,
-    format: &str,
-    speed: Option<f64>,
-) -> Result<Vec<u8>> {
-    let fmt = find_format(format)?;
-    let samples = tensor.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let samples = match speed {
-        Some(s) if (s - 1.0).abs() > f64::EPSILON => speed_adjust(&samples, sample_rate, s)?,
-        _ => samples,
-    };
-    match fmt.container {
-        "wav" => encode_wav_manual(&samples, sample_rate),
-        "raw" => Ok(encode_pcm_raw(&samples)),
-        _ => encode_via_ffmpeg(&samples, sample_rate, fmt),
-    }
-}
-
-fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32>> {
-    if !(0.25..=4.0).contains(&speed) {
-        bail!("speed must be between 0.25 and 4.0, got {}", speed);
-    }
-    let factors = build_atempo_chain(speed);
-    let mut graph = build_atempo_graph(sample_rate, &factors)?;
-    push_samples_to_graph(&mut graph, samples, sample_rate)?;
-    flush_and_drain_graph(&mut graph, samples.len())
-}
-
-fn build_atempo_graph(sample_rate: u32, factors: &[f64]) -> Result<ffmpeg::filter::Graph> {
-    let mut graph = ffmpeg::filter::Graph::new();
-
-    let abuffer =
-        ffmpeg::filter::find("abuffer").ok_or_else(|| anyhow!("abuffer filter not found"))?;
-    let atempo_filt =
-        ffmpeg::filter::find("atempo").ok_or_else(|| anyhow!("atempo filter not found"))?;
-    let abuffersink = ffmpeg::filter::find("abuffersink")
-        .ok_or_else(|| anyhow!("abuffersink filter not found"))?;
-
-    let in_args = format!("sample_rate={sample_rate}:sample_fmt=flt:channel_layout=mono");
-    graph.add(&abuffer, "in", &in_args)?;
-
-    let atempo_names: Vec<String> = (0..factors.len()).map(|i| format!("atempo{i}")).collect();
-    for (i, &factor) in factors.iter().enumerate() {
-        graph.add(&atempo_filt, &atempo_names[i], &format!("{factor}"))?;
-    }
-
-    graph.add(&abuffersink, "out", "")?;
-
-    {
-        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
-        let mut first = graph
-            .get(&atempo_names[0])
-            .ok_or_else(|| anyhow!("atempo0 context"))?;
-        in_ctx.link(0, &mut first, 0);
-    }
-    for i in 1..factors.len() {
-        let mut prev = graph
-            .get(&atempo_names[i - 1])
-            .ok_or_else(|| anyhow!("atempo context"))?;
-        let mut cur = graph
-            .get(&atempo_names[i])
-            .ok_or_else(|| anyhow!("atempo context"))?;
-        prev.link(0, &mut cur, 0);
-    }
-    {
-        let mut last = graph
-            .get(&atempo_names[factors.len() - 1])
-            .ok_or_else(|| anyhow!("last atempo context"))?;
-        let mut out_ctx = graph.get("out").ok_or_else(|| anyhow!("out context"))?;
-        last.link(0, &mut out_ctx, 0);
-    }
-
-    graph.validate()?;
-    Ok(graph)
-}
-
-fn push_samples_to_graph(
-    graph: &mut ffmpeg::filter::Graph,
-    samples: &[f32],
-    sample_rate: u32,
-) -> Result<()> {
-    let chunk_size = 4096;
-    let mut next_pts: i64 = 0;
-
-    for chunk in samples.chunks(chunk_size) {
-        let mut frame = ffmpeg::util::frame::Audio::new(
-            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
-            chunk.len(),
-            ffmpeg::channel_layout::ChannelLayout::MONO,
-        );
-        frame.set_rate(sample_rate);
-        frame.set_pts(Some(next_pts));
-        let data = frame.plane_mut::<f32>(0);
-        data.copy_from_slice(chunk);
-
-        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
-        in_ctx.source().add(&frame)?;
-
-        next_pts += chunk.len() as i64;
-    }
-
-    let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
-    in_ctx.source().flush()?;
-    Ok(())
-}
-
-fn flush_and_drain_graph(graph: &mut ffmpeg::filter::Graph, capacity: usize) -> Result<Vec<f32>> {
-    let mut result = Vec::with_capacity(capacity);
-    loop {
-        let mut out_frame = ffmpeg::util::frame::Audio::empty();
-        let mut out_ctx = graph.get("out").ok_or_else(|| anyhow!("out context"))?;
-        match out_ctx.sink().frame(&mut out_frame) {
-            Ok(()) => {
-                result.extend_from_slice(out_frame.plane::<f32>(0));
-            }
-            Err(_) => break,
-        }
-    }
-    Ok(result)
-}
-
-#[must_use]
-fn build_atempo_chain(speed: f64) -> Vec<f64> {
-    let mut factors = Vec::new();
-    let mut remaining = speed;
-    while remaining > 2.0 {
-        factors.push(2.0);
-        remaining /= 2.0;
-    }
-    while remaining < 0.5 {
-        factors.push(0.5);
-        remaining /= 0.5;
-    }
-    factors.push(remaining.clamp(0.5, 2.0));
-    factors
-}
-
-fn resolve_audio_bytes(path_str: &str) -> Result<Vec<u8>> {
-    if path_str.starts_with("http://") || path_str.starts_with("https://") {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let resp = reqwest::get(path_str).await?;
-                if !resp.status().is_success() {
-                    bail!("HTTP download failed: {}", resp.status());
-                }
-                Ok(resp.bytes().await?.to_vec())
-            })
-        })
-    } else if path_str.starts_with("file://") {
-        let path = Url::parse(path_str)
+    let bytes = if path.starts_with("http://") || path.starts_with("https://") {
+        download_audio(path)?
+    } else if path.starts_with("file://") {
+        let file_path = Url::parse(path)
             .ok()
             .and_then(|u| u.to_file_path().ok())
-            .unwrap_or_else(|| PathBuf::from(&path_str[7..]));
-        Ok(std::fs::read(&path).context("reading file:// audio")?)
-    } else if path_str.starts_with("data:audio") && path_str.contains("base64,") {
-        let data = path_str
+            .unwrap_or_else(|| PathBuf::from(&path[7..]));
+        std::fs::read(&file_path).context("read audio file")?
+    } else if path.starts_with("data:audio") && path.contains("base64,") {
+        let data = path
             .split_once("base64,")
             .map(|x| x.1)
             .ok_or_else(|| anyhow!("invalid base64 audio data URI"))?;
-        Ok(BASE64_STANDARD.decode(data)?)
+        BASE64_STANDARD.decode(data)?
     } else {
-        let path = PathBuf::from(path_str);
-        if path.exists() {
-            Ok(std::fs::read(path).context("reading audio file")?)
+        let file_path = PathBuf::from(path);
+        if file_path.exists() {
+            std::fs::read(&file_path).context("read audio file")?
         } else {
-            Err(anyhow!("audio file not found: {}", path_str))
+            bail!("audio file not found: {}", path);
         }
+    };
+    let (audio, sr) = decode_symphonia(&bytes, device).context("symphonia decode")?;
+    if sr == target_sr {
+        Ok(audio)
+    } else {
+        resample_simple(&audio, sr as i64, target_sr as i64, device)
     }
 }
 
-fn decode_bytes(bytes: &[u8], device: &Device, target_sr: usize) -> Result<Tensor> {
-    let tmp = tempfile::NamedTempFile::new()?;
-    tmp.as_file().write_all(bytes)?;
-    let path = tmp
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow!("temp path not utf-8"))?;
+fn download_audio(url: &str) -> Result<Vec<u8>> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::get(url).await?;
+            if !resp.status().is_success() {
+                bail!("HTTP download failed: {}", resp.status());
+            }
+            Ok(resp.bytes().await?.to_vec())
+        })
+    })
+}
 
-    let mut ictx = ffmpeg::format::input(path)?;
-    let input_stream = ictx
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .ok_or_else(|| anyhow!("no audio stream found"))?;
-    let stream_idx = input_stream.index();
+fn decode_symphonia(bytes: &[u8], device: &Device) -> Result<(Tensor, usize)> {
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
-    let ctx = ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())?;
-    let mut decoder = ctx.decoder().audio()?;
+    let mut hint = Hint::new();
+    if bytes.starts_with(b"RIFF") {
+        hint.with_extension("wav");
+    } else if bytes.starts_with(b"\xff\xfb")
+        || bytes.starts_with(b"\xff\xf3")
+        || bytes.starts_with(b"ID3")
+    {
+        hint.with_extension("mp3");
+    } else if bytes.starts_with(b"fLaC") {
+        hint.with_extension("flac");
+    } else if bytes.starts_with(b"OggS") {
+        hint.with_extension("ogg");
+    }
 
-    let out_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-    let out_layout = ffmpeg::channel_layout::ChannelLayout::MONO;
-
-    let mut resampler = ffmpeg::software::resampling::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        out_format,
-        out_layout,
-        target_sr as u32,
+    let probed = symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
     )?;
 
-    let mut all_samples = Vec::new();
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| anyhow!("no audio track found"))?;
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow!("unknown sample rate"))?;
+    let mut decoder =
+        symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
-    for (stream, packet) in ictx.packets() {
-        if stream.index() != stream_idx {
-            continue;
+    let mut all_samples: Vec<Vec<f32>> = Vec::new();
+    let mut channels = 1usize;
+
+    while let Ok(packet) = format.next_packet() {
+        match decoder.decode(&packet) {
+            Ok(decoded) => match decoded {
+                AudioBufferRef::F32(buf) => {
+                    channels = buf.spec().channels.count();
+                    for ch in 0..channels {
+                        if all_samples.len() <= ch {
+                            all_samples.push(Vec::new());
+                        }
+                        all_samples[ch].extend_from_slice(buf.chan(ch));
+                    }
+                }
+                AudioBufferRef::S16(buf) => {
+                    channels = buf.spec().channels.count();
+                    for ch in 0..channels {
+                        if all_samples.len() <= ch {
+                            all_samples.push(Vec::new());
+                        }
+                        all_samples[ch].extend(buf.chan(ch).iter().map(|&s| s as f32 / 32768.0));
+                    }
+                }
+                AudioBufferRef::S24(buf) => {
+                    channels = buf.spec().channels.count();
+                    for ch in 0..channels {
+                        if all_samples.len() <= ch {
+                            all_samples.push(Vec::new());
+                        }
+                        all_samples[ch]
+                            .extend(buf.chan(ch).iter().map(|s| s.inner() as f32 / 8388608.0));
+                    }
+                }
+                AudioBufferRef::S32(buf) => {
+                    channels = buf.spec().channels.count();
+                    for ch in 0..channels {
+                        if all_samples.len() <= ch {
+                            all_samples.push(Vec::new());
+                        }
+                        all_samples[ch]
+                            .extend(buf.chan(ch).iter().map(|&s| s as f32 / 2147483648.0));
+                    }
+                }
+                AudioBufferRef::U8(buf) => {
+                    channels = buf.spec().channels.count();
+                    for ch in 0..channels {
+                        if all_samples.len() <= ch {
+                            all_samples.push(Vec::new());
+                        }
+                        all_samples[ch]
+                            .extend(buf.chan(ch).iter().map(|&s| (s as f32 - 128.0) / 128.0));
+                    }
+                }
+                _ => {
+                    bail!("unsupported audio sample format");
+                }
+            },
+            Err(_) => break,
         }
-        decoder.send_packet(&packet)?;
-        let mut frame = ffmpeg::util::frame::Audio::empty();
-        while decoder.receive_frame(&mut frame).is_ok() {
-            let mut resampled = ffmpeg::util::frame::Audio::empty();
-            resampler.run(&frame, &mut resampled)?;
-            let data = resampled.data(0);
-            let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-            all_samples.extend_from_slice(&f32_data);
-        }
     }
 
-    decoder.send_eof()?;
-    let mut frame = ffmpeg::util::frame::Audio::empty();
-    while decoder.receive_frame(&mut frame).is_ok() {
-        let mut resampled = ffmpeg::util::frame::Audio::empty();
-        resampler.run(&frame, &mut resampled)?;
-        let data = resampled.data(0);
-        let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-        all_samples.extend_from_slice(&f32_data);
+    let mut audio = Tensor::new(all_samples, device)?;
+    if channels > 1 {
+        audio = audio.mean_keepdim(0)?;
     }
+    Ok((audio, sample_rate as usize))
+}
 
-    {
-        let mut resampled = ffmpeg::util::frame::Audio::empty();
-        while resampler.flush(&mut resampled).is_ok() && resampled.samples() > 0 {
-            let data = resampled.data(0);
-            let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-            all_samples.extend_from_slice(&f32_data);
-        }
+fn resample_simple(
+    waveform: &Tensor,
+    orig_freq: i64,
+    new_freq: i64,
+    device: &Device,
+) -> Result<Tensor> {
+    resample(waveform, orig_freq, new_freq, 6, 0.99, device)
+}
+
+fn resample(
+    waveform: &Tensor,
+    orig_freq: i64,
+    new_freq: i64,
+    lowpass_filter_width: i64,
+    rolloff: f64,
+    device: &Device,
+) -> Result<Tensor> {
+    if orig_freq == new_freq {
+        return Ok(waveform.clone());
     }
-
-    drop(tmp);
-    let len = all_samples.len();
-    Ok(Tensor::from_vec(all_samples, (1, len), device)?)
+    let gcd_val = gcd(orig_freq, new_freq);
+    let (kernel, width) = get_sinc_resample_kernel(
+        orig_freq,
+        new_freq,
+        gcd_val,
+        lowpass_filter_width,
+        rolloff,
+        device,
+    )?;
+    apply_sinc_resample_kernel(waveform, orig_freq, new_freq, gcd_val, &kernel, width)
 }
 
-struct EncoderCtx<'a> {
-    encoder: &'a mut ffmpeg::codec::encoder::Audio,
-    octx: &'a mut ffmpeg::format::context::Output,
-    time_base: (i32, i32),
+fn get_sinc_resample_kernel(
+    orig_freq: i64,
+    new_freq: i64,
+    gcd_val: i64,
+    lowpass_filter_width: i64,
+    rolloff: f64,
+    device: &Device,
+) -> Result<(Tensor, i64)> {
+    let orig_freq = orig_freq / gcd_val;
+    let new_freq = new_freq / gcd_val;
+    let base_freq = (orig_freq.min(new_freq) as f64) * rolloff;
+    let width = ((lowpass_filter_width as f64) * (orig_freq as f64) / base_freq).ceil() as i64;
+
+    let idx = Tensor::arange(-width as f32, (width + orig_freq) as f32, device)?
+        .affine(1.0 / orig_freq as f64, 0.0)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
+
+    let t = Tensor::arange_step(0.0f32, -(new_freq as f32), -1.0f32, device)?
+        .affine(1.0 / new_freq as f64, 0.0)?
+        .unsqueeze(candle_core::D::Minus1)?
+        .unsqueeze(candle_core::D::Minus1)?
+        .broadcast_add(&idx)?
+        .affine(base_freq, 0.0)?;
+    let t = t.clamp(-(lowpass_filter_width as f32), lowpass_filter_width as f32)?;
+
+    let window_arg = t.affine(PI / (lowpass_filter_width as f64) / 2.0, 0.0)?;
+    let window = window_arg.cos()?.sqr()?;
+
+    let scale = base_freq / (orig_freq as f64);
+    let t_scaled = t.affine(PI, 0.0)?;
+    let t_zeros = Tensor::zeros_like(&t_scaled)?;
+    let t_ones = Tensor::ones_like(&t_scaled)?;
+    let mask = t_scaled.eq(&t_zeros)?;
+    let sinc = mask.where_cond(&t_ones, &t_scaled.sin()?.div(&t_scaled)?)?;
+    let kernels = sinc.mul(&window)?.affine(scale, 0.0)?;
+
+    Ok((kernels, width))
 }
 
-fn drain_encoder(ctx: &mut EncoderCtx) -> Result<()> {
-    let mut pkt = ffmpeg::Packet::empty();
-    while ctx.encoder.receive_packet(&mut pkt).is_ok() {
-        pkt.set_stream(0);
-        pkt.rescale_ts(ctx.time_base, ctx.time_base);
-        pkt.write_interleaved(ctx.octx)?;
+fn apply_sinc_resample_kernel(
+    waveform: &Tensor,
+    orig_freq: i64,
+    new_freq: i64,
+    gcd_val: i64,
+    kernel: &Tensor,
+    width: i64,
+) -> Result<Tensor> {
+    let orig_freq = orig_freq / gcd_val;
+    let new_freq = new_freq / gcd_val;
+
+    let dims = waveform.dims();
+    let waveform_flat = waveform.reshape(((), dims[dims.len() - 1]))?;
+    let (num_wavs, length) = waveform_flat.dims2()?;
+
+    let padded = waveform_flat.pad_with_zeros(
+        candle_core::D::Minus1,
+        width as usize,
+        (width + orig_freq) as usize,
+    )?;
+    let waveform_3d = padded.unsqueeze(1)?;
+
+    let conv = candle_nn::Conv1d::new(
+        kernel.clone(),
+        None,
+        candle_nn::Conv1dConfig {
+            padding: 0,
+            stride: orig_freq as usize,
+            dilation: 1,
+            groups: 1,
+            cudnn_fwd_algo: None,
+        },
+    );
+    let conv_output = conv.forward(&waveform_3d)?;
+    let conv_transposed = conv_output.transpose(1, 2)?.reshape((num_wavs, ()))?;
+
+    let target_length = ((new_freq as f64 * length as f64) / orig_freq as f64).ceil() as usize;
+    let resampled = conv_transposed.narrow(1, 0, target_length.min(conv_transposed.dim(1)?))?;
+
+    let resampled_dim = resampled.dim(1)?;
+    let mut new_dims = dims.to_vec();
+    if let Some(d) = new_dims.last_mut() {
+        *d = resampled_dim;
     }
-    Ok(())
-}
-
-fn send_audio_frame(
-    f32_data: &[f32],
-    format: ffmpeg::format::Sample,
-    layout: ffmpeg::channel_layout::ChannelLayout,
-    channels: usize,
-    frame_size: usize,
-    ctx: &mut EncoderCtx,
-) -> Result<()> {
-    let mut pts: i64 = 0;
-    for chunk in f32_data.chunks(frame_size * channels) {
-        let chunk_samples = chunk.len() / channels;
-        let mut frame = ffmpeg::util::frame::Audio::new(format, chunk_samples, layout);
-        let dst = frame.data_mut(0);
-        let src_bytes = bytemuck::cast_slice::<f32, u8>(chunk);
-        dst[..src_bytes.len()].copy_from_slice(src_bytes);
-        frame.set_pts(Some(pts));
-        pts += chunk_samples as i64;
-        ctx.encoder.send_frame(&frame)?;
-        drain_encoder(ctx)?;
-    }
-    Ok(())
-}
-
-fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Result<Vec<u8>> {
-    let tmp_out = tempfile::NamedTempFile::new()?;
-
-    let mut octx = ffmpeg::format::output(&tmp_out.path())?;
-    let ocodec = ffmpeg::encoder::find_by_name(fmt.codec)
-        .ok_or_else(|| anyhow!("codec '{}' not found", fmt.codec))?;
-    let audio_codec = ocodec.audio()?;
-
-    let has_global_header = octx
-        .format()
-        .flags()
-        .contains(ffmpeg::format::flag::Flags::GLOBAL_HEADER);
-
-    let mut ostream = octx.add_stream(audio_codec)?;
-    let enc_ctx = ffmpeg::codec::context::Context::from_parameters(ostream.parameters())?;
-    let mut encoder = enc_ctx.encoder().audio()?;
-
-    let layout = ffmpeg::channel_layout::ChannelLayout::MONO;
-    let enc_format =
-        audio_codec
-            .formats()
-            .and_then(|mut f| f.next())
-            .unwrap_or(ffmpeg::format::Sample::F32(
-                ffmpeg::format::sample::Type::Packed,
-            ));
-
-    encoder.set_rate(sample_rate as i32);
-    encoder.set_channel_layout(layout);
-    encoder.set_format(enc_format);
-    encoder.set_time_base((1, sample_rate as i32));
-    ostream.set_time_base((1, sample_rate as i32));
-
-    if has_global_header {
-        encoder.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
-    }
-
-    let time_base = (1, sample_rate as i32);
-
-    let mut encoder = encoder.open_as(audio_codec)?;
-    ostream.set_parameters(&encoder);
-
-    let frame_size = encoder.frame_size().max(1) as usize;
-
-    octx.write_header()?;
-    {
-        let mut ctx = EncoderCtx {
-            encoder: &mut encoder,
-            octx: &mut octx,
-            time_base,
-        };
-        send_audio_frame(samples, enc_format, layout, 1, frame_size, &mut ctx)?;
-        ctx.encoder.send_eof()?;
-        drain_encoder(&mut ctx)?;
-    }
-    octx.write_trailer()?;
-
-    let result = std::fs::read(tmp_out.path())?;
-    drop(tmp_out);
-    Ok(result)
-}
-
-#[must_use]
-fn f32_to_i16_le(samples: &[f32]) -> Vec<u8> {
-    let max_val = samples
-        .iter()
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
-    let scale = if max_val > 1.0 {
-        32767.0 / max_val
-    } else {
-        32767.0
-    };
-    samples
-        .iter()
-        .flat_map(|&s| {
-            let v = (s * scale).round().clamp(-32768.0, 32767.0) as i16;
-            v.to_le_bytes()
-        })
-        .collect()
-}
-
-#[must_use]
-fn encode_pcm_raw(samples: &[f32]) -> Vec<u8> {
-    f32_to_i16_le(samples)
-}
-
-fn encode_wav_manual(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
-    let pcm = f32_to_i16_le(samples);
-    let data_size = pcm.len() as u32;
-    let file_size = 36 + data_size;
-
-    let mut buf = Vec::with_capacity(44 + data_size as usize);
-
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&file_size.to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * 2;
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    buf.extend_from_slice(&2u16.to_le_bytes());
-    buf.extend_from_slice(&16u16.to_le_bytes());
-
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_size.to_le_bytes());
-    buf.extend_from_slice(&pcm);
-
-    Ok(buf)
+    Ok(resampled.reshape(new_dims)?)
 }
