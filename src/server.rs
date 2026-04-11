@@ -22,7 +22,6 @@ pub struct SpeechRequest {
     pub voice: Option<String>,
     #[serde(default = "default_response_format")]
     pub response_format: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub speed: Option<f64>,
     pub prompt_text: Option<String>,
@@ -150,10 +149,21 @@ async fn speech_handler(
         return (status, body).into_response();
     }
 
+    if let Some(speed) = req.speed
+        && !(0.25..=4.0).contains(&speed)
+    {
+        let (status, body) = error_response(
+            StatusCode::BAD_REQUEST,
+            format!("speed must be between 0.25 and 4.0, got {}", speed),
+        );
+        return (status, body).into_response();
+    }
+
     let prompt_text = req.prompt_text;
     let prompt_wav_path = req.prompt_wav_url;
     let control_instruction = req.control_instruction;
     let voice = req.voice;
+    let speed = req.speed;
     let config = InferenceConfig {
         min_len: req.min_len.unwrap_or(2),
         max_len: req.max_len.unwrap_or(4096),
@@ -191,7 +201,7 @@ async fn speech_handler(
 
         let sr = engine.sample_rate() as u32;
         let ct = crate::audio::content_type(&response_format)?;
-        let bytes = crate::audio::encode(&audio_tensor, sr, &response_format)?;
+        let bytes = crate::audio::encode(&audio_tensor, sr, &response_format, speed)?;
         info!("TTS complete: {} bytes ({})", bytes.len(), response_format);
 
         let mut headers = HeaderMap::new();

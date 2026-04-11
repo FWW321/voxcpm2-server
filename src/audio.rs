@@ -88,14 +88,126 @@ pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
     decode_bytes(&bytes, device, target_sr)
 }
 
-pub fn encode(tensor: &Tensor, sample_rate: u32, format: &str) -> Result<Vec<u8>> {
+pub fn encode(
+    tensor: &Tensor,
+    sample_rate: u32,
+    format: &str,
+    speed: Option<f64>,
+) -> Result<Vec<u8>> {
     let fmt = find_format(format)?;
     let samples = tensor.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let samples = match speed {
+        Some(s) if (s - 1.0).abs() > f64::EPSILON => speed_adjust(&samples, sample_rate, s)?,
+        _ => samples,
+    };
     match fmt.container {
         "wav" => encode_wav_manual(&samples, sample_rate),
         "raw" => encode_pcm_raw(&samples),
         _ => encode_via_ffmpeg(&samples, sample_rate, fmt),
     }
+}
+
+fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32>> {
+    if !(0.25..=4.0).contains(&speed) {
+        bail!("speed must be between 0.25 and 4.0, got {}", speed);
+    }
+
+    let factors = build_atempo_chain(speed);
+
+    let mut graph = ffmpeg::filter::Graph::new();
+
+    let abuffer =
+        ffmpeg::filter::find("abuffer").ok_or_else(|| anyhow!("abuffer filter not found"))?;
+    let atempo_filt =
+        ffmpeg::filter::find("atempo").ok_or_else(|| anyhow!("atempo filter not found"))?;
+    let abuffersink = ffmpeg::filter::find("abuffersink")
+        .ok_or_else(|| anyhow!("abuffersink filter not found"))?;
+
+    let in_args = format!("sample_rate={sample_rate}:sample_fmt=flt:channel_layout=mono");
+    graph.add(&abuffer, "in", &in_args)?;
+
+    let atempo_names: Vec<String> = (0..factors.len()).map(|i| format!("atempo{i}")).collect();
+    for (i, &factor) in factors.iter().enumerate() {
+        graph.add(&atempo_filt, &atempo_names[i], &format!("{factor}"))?;
+    }
+
+    graph.add(&abuffersink, "out", "")?;
+
+    {
+        let mut in_ctx = graph.get("in").expect("in context");
+        let mut first = graph.get(&atempo_names[0]).expect("atempo0");
+        in_ctx.link(0, &mut first, 0);
+    }
+    for i in 1..factors.len() {
+        let mut prev = graph.get(&atempo_names[i - 1]).expect("prev atempo");
+        let mut cur = graph.get(&atempo_names[i]).expect("cur atempo");
+        prev.link(0, &mut cur, 0);
+    }
+    {
+        let mut last = graph
+            .get(&atempo_names[factors.len() - 1])
+            .expect("last atempo");
+        let mut out_ctx = graph.get("out").expect("out context");
+        last.link(0, &mut out_ctx, 0);
+    }
+
+    graph.validate()?;
+
+    let chunk_size = 4096;
+    let mut next_pts: i64 = 0;
+
+    for chunk in samples.chunks(chunk_size) {
+        let mut frame = ffmpeg::util::frame::Audio::new(
+            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
+            chunk.len(),
+            ffmpeg::channel_layout::ChannelLayout::MONO,
+        );
+        frame.set_rate(sample_rate);
+        frame.set_pts(Some(next_pts));
+        let data = frame.plane_mut::<f32>(0);
+        data.copy_from_slice(chunk);
+
+        {
+            let mut in_ctx = graph.get("in").expect("in context");
+            in_ctx.source().add(&frame)?;
+        }
+
+        next_pts += chunk.len() as i64;
+    }
+
+    {
+        let mut in_ctx = graph.get("in").expect("in context");
+        in_ctx.source().flush()?;
+    }
+
+    let mut result = Vec::with_capacity(samples.len());
+    loop {
+        let mut out_frame = ffmpeg::util::frame::Audio::empty();
+        let mut out_ctx = graph.get("out").expect("out context");
+        match out_ctx.sink().frame(&mut out_frame) {
+            Ok(()) => {
+                result.extend_from_slice(out_frame.plane::<f32>(0));
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(result)
+}
+
+fn build_atempo_chain(speed: f64) -> Vec<f64> {
+    let mut factors = Vec::new();
+    let mut remaining = speed;
+    while remaining > 2.0 {
+        factors.push(2.0);
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        factors.push(0.5);
+        remaining /= 0.5;
+    }
+    factors.push(remaining.clamp(0.5, 2.0));
+    factors
 }
 
 fn resolve_audio_bytes(path_str: &str) -> Result<Vec<u8>> {
