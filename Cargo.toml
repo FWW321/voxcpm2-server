@@ -1,8 +1,8 @@
 [package]
-name = "voxcpm2"
+name = "voxcpm2-rs"
 version = "0.3.0"
 edition = "2024"
-description = "VoxCPM2 TTS CLI tool"
+description = "VoxCPM2 TTS CLI tool (Rust)"
 
 [dependencies]
 candle-core = { version = "0.10" }

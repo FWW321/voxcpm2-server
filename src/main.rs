@@ -22,7 +22,7 @@ const REQUIRED_FILES: &[&str] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "voxcpm2", about = "VoxCPM2 TTS CLI")]
+#[command(name = "voxcpm2-rs", about = "VoxCPM2 TTS CLI (Rust)")]
 struct Cli {
     #[arg(long, help = "Path to VoxCPM2 model directory")]
     model: Option<String>,

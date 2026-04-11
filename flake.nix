@@ -53,14 +53,14 @@
         CPATH = "${pkgs.cudaPackages.cudatoolkit}/include";
 
         shellHook = ''
-          echo "voxcpm2 dev shell"
+          echo "voxcpm2-rs dev shell"
           echo "rustc: $(rustc --version)"
           echo "cuda:  ${pkgs.cudaPackages.cudatoolkit.version}"
         '';
       };
 
       packages.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "voxcpm2";
+        pname = "voxcpm2-rs";
         version = "0.3.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
@@ -71,8 +71,8 @@
         LIBRARY_PATH = cudaLinkPath;
 
         meta = {
-          description = "VoxCPM2 TTS CLI tool";
-          mainProgram = "voxcpm2";
+          description = "VoxCPM2 TTS CLI tool (Rust)";
+          mainProgram = "voxcpm2-rs";
         };
       };
     });
