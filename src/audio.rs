@@ -1,35 +1,40 @@
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use candle_core::{DType, Device, Tensor};
 use ffmpeg_next as ffmpeg;
 use url::Url;
 
+#[derive(Clone, Copy)]
+enum AudioContentType {
+    Mp3,
+    Opus,
+    Aac,
+    Flac,
+    Wav,
+    Pcm,
+}
+
+impl AudioContentType {
+    fn as_str(&self, sample_rate: u32) -> Cow<'static, str> {
+        match self {
+            AudioContentType::Mp3 => Cow::Borrowed("audio/mpeg"),
+            AudioContentType::Opus => Cow::Borrowed("audio/ogg; codecs=opus"),
+            AudioContentType::Aac => Cow::Borrowed("audio/aac"),
+            AudioContentType::Flac => Cow::Borrowed("audio/flac"),
+            AudioContentType::Wav => Cow::Borrowed("audio/wav"),
+            AudioContentType::Pcm => Cow::Owned(format!("audio/pcm;rate={sample_rate}")),
+        }
+    }
+}
+
 struct FormatDef {
     codec: &'static str,
     container: &'static str,
-    content_type_fn: fn(u32) -> String,
-}
-
-fn content_type_mp3(_: u32) -> String {
-    "audio/mpeg".to_string()
-}
-fn content_type_opus(_: u32) -> String {
-    "audio/ogg; codecs=opus".to_string()
-}
-fn content_type_aac(_: u32) -> String {
-    "audio/aac".to_string()
-}
-fn content_type_flac(_: u32) -> String {
-    "audio/flac".to_string()
-}
-fn content_type_wav(_: u32) -> String {
-    "audio/wav".to_string()
-}
-fn content_type_pcm(sr: u32) -> String {
-    format!("audio/pcm;rate={sr}")
+    content_type: AudioContentType,
 }
 
 static FORMATS: &[(&str, FormatDef)] = &[
@@ -38,7 +43,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "libmp3lame",
             container: "mp3",
-            content_type_fn: content_type_mp3,
+            content_type: AudioContentType::Mp3,
         },
     ),
     (
@@ -46,7 +51,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "libopus",
             container: "ogg",
-            content_type_fn: content_type_opus,
+            content_type: AudioContentType::Opus,
         },
     ),
     (
@@ -54,7 +59,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "aac",
             container: "adts",
-            content_type_fn: content_type_aac,
+            content_type: AudioContentType::Aac,
         },
     ),
     (
@@ -62,7 +67,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "flac",
             container: "flac",
-            content_type_fn: content_type_flac,
+            content_type: AudioContentType::Flac,
         },
     ),
     (
@@ -70,7 +75,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "pcm_s16le",
             container: "wav",
-            content_type_fn: content_type_wav,
+            content_type: AudioContentType::Wav,
         },
     ),
     (
@@ -78,7 +83,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "pcm_s16le",
             container: "raw",
-            content_type_fn: content_type_pcm,
+            content_type: AudioContentType::Pcm,
         },
     ),
 ];
@@ -98,8 +103,8 @@ fn find_format(name: &str) -> Result<&'static FormatDef> {
         })
 }
 
-pub fn content_type(format: &str, sample_rate: u32) -> Result<String> {
-    Ok((find_format(format)?.content_type_fn)(sample_rate))
+pub fn content_type(format: &str, sample_rate: u32) -> Result<Cow<'static, str>> {
+    Ok(find_format(format)?.content_type.as_str(sample_rate))
 }
 
 pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
@@ -121,7 +126,7 @@ pub fn encode(
     };
     match fmt.container {
         "wav" => encode_wav_manual(&samples, sample_rate),
-        "raw" => encode_pcm_raw(&samples),
+        "raw" => Ok(encode_pcm_raw(&samples)),
         _ => encode_via_ffmpeg(&samples, sample_rate, fmt),
     }
 }
@@ -130,9 +135,13 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
     if !(0.25..=4.0).contains(&speed) {
         bail!("speed must be between 0.25 and 4.0, got {}", speed);
     }
-
     let factors = build_atempo_chain(speed);
+    let mut graph = build_atempo_graph(sample_rate, &factors)?;
+    push_samples_to_graph(&mut graph, samples, sample_rate)?;
+    flush_and_drain_graph(&mut graph, samples.len())
+}
 
+fn build_atempo_graph(sample_rate: u32, factors: &[f64]) -> Result<ffmpeg::filter::Graph> {
     let mut graph = ffmpeg::filter::Graph::new();
 
     let abuffer =
@@ -177,7 +186,14 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
     }
 
     graph.validate()?;
+    Ok(graph)
+}
 
+fn push_samples_to_graph(
+    graph: &mut ffmpeg::filter::Graph,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<()> {
     let chunk_size = 4096;
     let mut next_pts: i64 = 0;
 
@@ -192,20 +208,19 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
         let data = frame.plane_mut::<f32>(0);
         data.copy_from_slice(chunk);
 
-        {
-            let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
-            in_ctx.source().add(&frame)?;
-        }
+        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
+        in_ctx.source().add(&frame)?;
 
         next_pts += chunk.len() as i64;
     }
 
-    {
-        let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
-        in_ctx.source().flush()?;
-    }
+    let mut in_ctx = graph.get("in").ok_or_else(|| anyhow!("in context"))?;
+    in_ctx.source().flush()?;
+    Ok(())
+}
 
-    let mut result = Vec::with_capacity(samples.len());
+fn flush_and_drain_graph(graph: &mut ffmpeg::filter::Graph, capacity: usize) -> Result<Vec<f32>> {
+    let mut result = Vec::with_capacity(capacity);
     loop {
         let mut out_frame = ffmpeg::util::frame::Audio::empty();
         let mut out_ctx = graph.get("out").ok_or_else(|| anyhow!("out context"))?;
@@ -216,10 +231,10 @@ fn speed_adjust(samples: &[f32], sample_rate: u32, speed: f64) -> Result<Vec<f32
             Err(_) => break,
         }
     }
-
     Ok(result)
 }
 
+#[must_use]
 fn build_atempo_chain(speed: f64) -> Vec<f64> {
     let mut factors = Vec::new();
     let mut remaining = speed;
@@ -251,7 +266,7 @@ fn resolve_audio_bytes(path_str: &str) -> Result<Vec<u8>> {
             .ok()
             .and_then(|u| u.to_file_path().ok())
             .unwrap_or_else(|| PathBuf::from(&path_str[7..]));
-        Ok(std::fs::read(path)?)
+        Ok(std::fs::read(&path).context("reading file:// audio")?)
     } else if path_str.starts_with("data:audio") && path_str.contains("base64,") {
         let data = path_str
             .split_once("base64,")
@@ -261,7 +276,7 @@ fn resolve_audio_bytes(path_str: &str) -> Result<Vec<u8>> {
     } else {
         let path = PathBuf::from(path_str);
         if path.exists() {
-            Ok(std::fs::read(path)?)
+            Ok(std::fs::read(path).context("reading audio file")?)
         } else {
             Err(anyhow!("audio file not found: {}", path_str))
         }
@@ -439,6 +454,7 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
     Ok(result)
 }
 
+#[must_use]
 fn f32_to_i16_le(samples: &[f32]) -> Vec<u8> {
     let max_val = samples
         .iter()
@@ -459,8 +475,9 @@ fn f32_to_i16_le(samples: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn encode_pcm_raw(samples: &[f32]) -> Result<Vec<u8>> {
-    Ok(f32_to_i16_le(samples))
+#[must_use]
+fn encode_pcm_raw(samples: &[f32]) -> Vec<u8> {
+    f32_to_i16_le(samples)
 }
 
 fn encode_wav_manual(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {

@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Embedding, Module, RmsNorm, VarBuilder, embedding, rms_norm};
 
@@ -104,9 +104,9 @@ pub struct MiniCPMDecoderLayer {
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    scale_depth: f32,
-    num_hidden_layers: usize,
     use_mup: bool,
+    scale_depth: f64,
+    num_hidden_layers: usize,
 }
 
 impl MiniCPMDecoderLayer {
@@ -152,10 +152,22 @@ impl MiniCPMDecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            scale_depth: cfg.scale_depth,
+            scale_depth: cfg.scale_depth as f64,
             num_hidden_layers: cfg.num_hidden_layers,
             use_mup: cfg.use_mup,
         })
+    }
+
+    fn scale_residual(&self, residual: &Tensor, xs: Tensor) -> Result<Tensor> {
+        if self.use_mup {
+            Ok((residual
+                + xs.affine(
+                    self.scale_depth / (self.num_hidden_layers as f64).sqrt(),
+                    0.0,
+                ))?)
+        } else {
+            Ok((residual + xs)?)
+        }
     }
 
     pub fn forward(
@@ -170,27 +182,11 @@ impl MiniCPMDecoderLayer {
         let xs = self
             .self_attn
             .forward(&xs, cos, sin, attention_mask, true)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                ))?
-        } else {
-            (residual + xs)?
-        };
+        let xs = self.scale_residual(&residual, xs)?;
         let residual = xs.clone();
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                ))?
-        } else {
-            (residual + xs)?
-        };
+        let xs = self.scale_residual(&residual, xs)?;
         Ok(xs)
     }
 
@@ -206,26 +202,10 @@ impl MiniCPMDecoderLayer {
         let xs = self
             .self_attn
             .forward_with_cache(&xs, cos, sin, attention_mask, true)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                )?)?
-        } else {
-            (residual + xs)?
-        };
+        let xs = self.scale_residual(&residual, xs)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                )?)?
-        } else {
-            (residual + xs)?
-        };
+        let xs = self.scale_residual(residual, xs)?;
         Ok(xs)
     }
     pub fn clear_kv_cache(&mut self) {

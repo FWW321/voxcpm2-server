@@ -20,37 +20,65 @@ pub struct SpeechRequest {
     pub model: Option<String>,
     pub input: String,
     pub voice: Option<String>,
-    #[serde(default = "default_response_format")]
     pub response_format: Option<String>,
     #[serde(default)]
     pub speed: Option<f64>,
     pub prompt_text: Option<String>,
     pub prompt_wav_url: Option<String>,
     pub control_instruction: Option<String>,
-    #[serde(default = "default_inference_timesteps")]
     pub inference_timesteps: Option<usize>,
-    #[serde(default = "default_cfg_value")]
     pub cfg_value: Option<f64>,
-    #[serde(default = "default_min_len")]
     pub min_len: Option<usize>,
-    #[serde(default = "default_max_len")]
     pub max_len: Option<usize>,
 }
 
-fn default_response_format() -> Option<String> {
-    Some("mp3".to_string())
-}
-fn default_inference_timesteps() -> Option<usize> {
-    Some(10)
-}
-fn default_cfg_value() -> Option<f64> {
-    Some(2.0)
-}
-fn default_min_len() -> Option<usize> {
-    Some(2)
-}
-fn default_max_len() -> Option<usize> {
-    Some(4096)
+impl SpeechRequest {
+    fn response_format(&self) -> &str {
+        self.response_format.as_deref().unwrap_or("mp3")
+    }
+
+    fn config(&self) -> InferenceConfig {
+        InferenceConfig {
+            min_len: self.min_len.unwrap_or(2),
+            max_len: self.max_len.unwrap_or(4096),
+            inference_timesteps: self.inference_timesteps.unwrap_or(10),
+            cfg_value: self.cfg_value.unwrap_or(2.0),
+            ..Default::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if self.input.is_empty() {
+            return Err(error_response(StatusCode::BAD_REQUEST, "input is required"));
+        }
+        if let Some(ref model) = self.model
+            && model != SUPPORTED_MODEL
+        {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Model '{}' not found. Supported: {}",
+                    model, SUPPORTED_MODEL
+                ),
+            ));
+        }
+        let fmt = self.response_format();
+        if crate::audio::content_type(fmt, 24000).is_err() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported response_format '{}'", fmt),
+            ));
+        }
+        if let Some(speed) = self.speed
+            && !(0.25..=4.0).contains(&speed)
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("speed must be between 0.25 and 4.0, got {}", speed),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,10 +90,10 @@ pub struct VoiceRequest {
 
 #[derive(Debug, Serialize)]
 struct ModelObject {
-    id: String,
-    object: String,
+    id: &'static str,
+    object: &'static str,
     created: u64,
-    owned_by: String,
+    owned_by: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,65 +150,23 @@ async fn speech_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SpeechRequest>,
 ) -> Response {
-    if req.input.is_empty() {
-        let (status, body) = error_response(StatusCode::BAD_REQUEST, "input is required");
+    if let Err((status, body)) = req.validate() {
         return (status, body).into_response();
     }
 
-    if let Some(ref model) = req.model
-        && model != SUPPORTED_MODEL
-    {
-        let (status, body) = error_response(
-            StatusCode::NOT_FOUND,
-            format!(
-                "Model '{}' not found. Supported: {}",
-                model, SUPPORTED_MODEL
-            ),
-        );
-        return (status, body).into_response();
-    }
+    let response_format = req.response_format().to_string();
+    let speed = req.speed;
+    let config = req.config();
 
-    let response_format = req.response_format.unwrap_or_else(|| "mp3".to_string());
-    if crate::audio::content_type(&response_format, 24000).is_err() {
-        let (status, body) = error_response(
-            StatusCode::BAD_REQUEST,
-            format!("Unsupported response_format '{}'", response_format),
-        );
-        return (status, body).into_response();
-    }
-
-    if let Some(speed) = req.speed
-        && !(0.25..=4.0).contains(&speed)
-    {
-        let (status, body) = error_response(
-            StatusCode::BAD_REQUEST,
-            format!("speed must be between 0.25 and 4.0, got {}", speed),
-        );
-        return (status, body).into_response();
-    }
-
+    let input_preview: String = req.input.chars().take(50).collect();
     let prompt_text = req.prompt_text;
     let prompt_wav_path = req.prompt_wav_url;
     let control_instruction = req.control_instruction;
     let voice = req.voice;
-    let speed = req.speed;
-    let config = InferenceConfig {
-        min_len: req.min_len.unwrap_or(2),
-        max_len: req.max_len.unwrap_or(4096),
-        inference_timesteps: req.inference_timesteps.unwrap_or(10),
-        cfg_value: req.cfg_value.unwrap_or(2.0),
-        ..Default::default()
-    };
-
-    let input_preview: String = req.input.chars().take(50).collect();
+    let has_ref_audio = prompt_wav_path.is_some();
     info!(
         "TTS request: input='{}...', voice={:?}, format={}, prompt_text={:?}, has_ref_audio={}, control_instruction={:?}",
-        input_preview,
-        voice,
-        response_format,
-        prompt_text,
-        prompt_wav_path.is_some(),
-        control_instruction,
+        input_preview, voice, response_format, prompt_text, has_ref_audio, control_instruction,
     );
 
     let state = Arc::clone(&state);
@@ -191,7 +177,7 @@ async fn speech_handler(
             .lock()
             .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
         let audio_tensor = engine.generate(
-            input,
+            &input,
             prompt_text,
             prompt_wav_path,
             control_instruction,
@@ -307,10 +293,10 @@ async fn models_handler() -> impl IntoResponse {
     let response = ModelsResponse {
         object: "list".into(),
         data: vec![ModelObject {
-            id: SUPPORTED_MODEL.into(),
-            object: "model".into(),
+            id: SUPPORTED_MODEL,
+            object: "model",
             created: 0,
-            owned_by: "openbmb".into(),
+            owned_by: "openbmb",
         }],
     };
     Json(response)

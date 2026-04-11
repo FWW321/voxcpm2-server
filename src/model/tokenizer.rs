@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use tokenizers::Tokenizer;
 
 pub struct SingleChineseTokenizer {
@@ -8,16 +8,16 @@ pub struct SingleChineseTokenizer {
 
 impl SingleChineseTokenizer {
     pub fn new(path: &str) -> Result<Self> {
-        let path = path.to_string();
-        if !std::path::Path::new(&path).exists() {
+        let model_dir = std::path::Path::new(path);
+        if !model_dir.exists() {
             bail!("model path does not exist: {}", path);
         }
-        let tokenizer_file = path.clone() + "/tokenizer.json";
-        if !std::path::Path::new(&tokenizer_file).exists() {
+        let tokenizer_file = model_dir.join("tokenizer.json");
+        if !tokenizer_file.exists() {
             bail!("tokenizer.json not found in model path: {}", path);
         }
-        let tokenizer = Tokenizer::from_file(tokenizer_file)
-            .map_err(|e| anyhow!(format!("tokenizer from file error{e}")))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_file)
+            .map_err(|e| anyhow!("tokenizer from file error: {e}"))?;
         let mut multichar_tokens = Vec::new();
         for (token, _) in tokenizer.get_vocab(false) {
             let len = token.chars().count();
@@ -40,22 +40,21 @@ impl SingleChineseTokenizer {
         let encode = self
             .tokenizer
             .encode(text, false)
-            .map_err(|e| anyhow!(format!("tokenizer encode error: {e}")))?;
+            .map_err(|e| anyhow!("tokenizer encode error: {e}"))?;
         let tokens = encode.get_tokens();
-        let mut split_character = Vec::new();
+        let mut ids = Vec::with_capacity(tokens.len());
         for token in tokens {
             let clean_token = token.replace("▁", "");
             if self.multichar_tokens.contains(&clean_token) {
-                let chars: Vec<String> = clean_token.chars().map(|c| c.to_string()).collect();
-                split_character.extend(chars);
-            } else {
-                split_character.push(token.clone());
+                for ch in clean_token.chars() {
+                    if let Some(id) = self.tokenizer.token_to_id(&ch.to_string()) {
+                        ids.push(id);
+                    }
+                }
+            } else if let Some(id) = self.tokenizer.token_to_id(token) {
+                ids.push(id);
             }
         }
-        let ids: Vec<u32> = split_character
-            .iter()
-            .filter_map(|c| self.tokenizer.token_to_id(c))
-            .collect();
         Ok(ids)
     }
 }

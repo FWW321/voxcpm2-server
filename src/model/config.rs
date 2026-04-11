@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use candle_core::Tensor;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -116,4 +114,7 @@ impl Default for InferenceConfig {
     }
 }
 
-pub type PromptCache = HashMap<String, Tensor>;
+pub struct PromptCache {
+    pub text_token: Tensor,
+    pub audio_feat: Tensor,
+}

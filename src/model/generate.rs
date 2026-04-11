@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
@@ -22,7 +22,9 @@ impl VoxCPM2Engine {
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let device = &get_device(device);
         let config_path = format!("{}/config.json", path);
-        let config: VoxCPMConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
+        let config: VoxCPMConfig =
+            serde_json::from_slice(&std::fs::read(&config_path).context("reading config.json")?)
+                .context("parsing config.json")?;
 
         let audio_config = config
             .audio_vae_config
@@ -82,9 +84,7 @@ impl VoxCPM2Engine {
         let mut tensors = HashMap::new();
         for m in model_list {
             let dict = read_all_with_key(m, Some("state_dict"))?;
-            for (k, v) in dict {
-                tensors.insert(k, v);
-            }
+            tensors.extend(dict);
         }
         Ok(tensors)
     }
@@ -118,7 +118,7 @@ impl VoxCPM2Engine {
 
     pub fn generate(
         &mut self,
-        text: String,
+        text: &str,
         prompt_text: Option<String>,
         prompt_wav_path: Option<String>,
         control_instruction: Option<String>,
@@ -127,20 +127,16 @@ impl VoxCPM2Engine {
     ) -> Result<Tensor> {
         let text = match control_instruction {
             Some(instr) => format!("({instr}){text}"),
-            None => text,
+            None => text.to_string(),
         };
 
         let audio = if let Some(voice_name) = voice {
-            let cache = self
-                .voice_cache
-                .get(&voice_name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Voice preset '{}' not found. Register it first via POST /v1/audio/voices",
-                        voice_name
-                    )
-                })?
-                .clone();
+            let cache = self.voice_cache.get(&voice_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Voice preset '{}' not found. Register it first via POST /v1/audio/voices",
+                    voice_name
+                )
+            })?;
             self.voxcpm
                 .generate_with_prompt_cache(&text, cache, config)?
         } else {

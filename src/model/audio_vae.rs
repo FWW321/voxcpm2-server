@@ -312,7 +312,6 @@ pub struct CausalEncoder {
     block0: WNCausalConv1d,
     blocks: Vec<CausalEncoderBlock>,
     fc_mu: WNCausalConv1d,
-    fc_logvar: WNCausalConv1d,
 }
 
 impl CausalEncoder {
@@ -358,34 +357,19 @@ impl CausalEncoder {
                 stride: 1,
             },
         )?;
-        let fc_logvar = WNCausalConv1d::new(
-            vb.pp("fc_logvar"),
-            &WnConvConfig {
-                in_channels: d_model,
-                out_channels: laten_dim,
-                kernel_size: 3,
-                dilation: 1,
-                padding: 1,
-                groups: 1,
-                stride: 1,
-            },
-        )?;
         Ok(Self {
             block0,
             blocks,
             fc_mu,
-            fc_logvar,
         })
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let mut hidden_state = self.block0.forward(x)?;
         for block_i in &self.blocks {
             hidden_state = block_i.forward(&hidden_state)?;
         }
-        let mu = self.fc_mu.forward(&hidden_state)?;
-        let logvar = self.fc_logvar.forward(&hidden_state)?;
-        Ok((hidden_state, mu, logvar))
+        self.fc_mu.forward(&hidden_state)
     }
 }
 
@@ -442,8 +426,13 @@ impl CausalDecoderBlock {
     }
 }
 
+enum CondType {
+    ScaleBias,
+    Add,
+}
+
 pub struct SampleRateConditionLayer {
-    cond_type: String,
+    cond_type: CondType,
     scale_embed: Option<Embedding>,
     bias_embed: Option<Embedding>,
     cond_embed: Option<Embedding>,
@@ -456,18 +445,23 @@ impl SampleRateConditionLayer {
         sr_bin_buckets_len: usize,
         cond_type: String,
     ) -> Result<Self> {
-        let (scale_embed, bias_embed, cond_embed) = if cond_type.contains("scale_bias") {
+        let (cond, scale_embed, bias_embed, cond_embed) = if cond_type.contains("scale_bias") {
             let scale_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("scale_embed"))?;
             let bias_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("bias_embed"))?;
-            (Some(scale_embed), Some(bias_embed), None)
-        } else if cond_type.eq("add") {
+            (
+                CondType::ScaleBias,
+                Some(scale_embed),
+                Some(bias_embed),
+                None,
+            )
+        } else if cond_type == "add" {
             let cond_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("cond_embed"))?;
-            (None, None, Some(cond_embed))
+            (CondType::Add, None, None, Some(cond_embed))
         } else {
-            (None, None, None)
+            return Err(anyhow!("not support cond_type: {cond_type}"));
         };
         Ok(Self {
-            cond_type,
+            cond_type: cond,
             scale_embed,
             bias_embed,
             cond_embed,
@@ -475,20 +469,28 @@ impl SampleRateConditionLayer {
     }
 
     pub fn forward(&self, x: &Tensor, sr_cond: &Tensor) -> Result<Tensor> {
-        if self.cond_type.contains("scale_bias")
-            && let Some(scale_embed) = &self.scale_embed
-            && let Some(bias_embed) = &self.bias_embed
-        {
-            Ok(
-                x.broadcast_mul(&scale_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?
-                    .broadcast_add(&bias_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?,
-            )
-        } else if self.cond_type.eq("add")
-            && let Some(cond_embed) = &self.cond_embed
-        {
-            Ok(x.broadcast_add(&cond_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?)
-        } else {
-            Err(anyhow!("not support cond_type"))
+        match &self.cond_type {
+            CondType::ScaleBias => {
+                let scale_embed = self
+                    .scale_embed
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing scale_embed"))?;
+                let bias_embed = self
+                    .bias_embed
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing bias_embed"))?;
+                Ok(
+                    x.broadcast_mul(&scale_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?
+                        .broadcast_add(&bias_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?,
+                )
+            }
+            CondType::Add => {
+                let cond_embed = self
+                    .cond_embed
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing cond_embed"))?;
+                Ok(x.broadcast_add(&cond_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?)
+            }
         }
     }
 }
@@ -716,7 +718,7 @@ impl AudioVAE {
             _ => audio_data.clone(),
         };
         let audio_data = self.preprocess(&audio_data, sample_rate)?;
-        let (_, mu, _) = self.encoder.forward(&audio_data)?;
+        let mu = self.encoder.forward(&audio_data)?;
         Ok(mu)
     }
 }

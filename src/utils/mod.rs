@@ -7,12 +7,11 @@ pub fn bucketize(input: usize, boundaries: &[usize]) -> Result<usize> {
     if boundaries.is_empty() {
         return Err(anyhow!("bucketize param boundaries can not be empty"));
     }
-    match boundaries.binary_search(&input) {
-        Ok(i) => Ok(i),
-        Err(i) => Ok(i),
-    }
+    let idx = boundaries.binary_search(&input).unwrap_or_else(|i| i);
+    Ok(idx)
 }
 
+#[must_use]
 pub fn get_device(device: Option<&candle_core::Device>) -> candle_core::Device {
     match device {
         Some(d) => d.clone(),
@@ -35,6 +34,7 @@ pub fn get_device(device: Option<&candle_core::Device>) -> candle_core::Device {
     }
 }
 
+#[must_use]
 pub fn get_dtype(dtype: Option<candle_core::DType>, cfg_dtype: &str) -> candle_core::DType {
     match dtype {
         Some(d) => d,
