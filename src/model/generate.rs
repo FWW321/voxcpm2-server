@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{pickle::read_all_with_key, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 use tracing::info;

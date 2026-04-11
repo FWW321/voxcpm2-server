@@ -3,6 +3,9 @@ mod model;
 mod nn;
 mod utils;
 
+#[cfg(feature = "gui")]
+mod gui;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -22,16 +25,16 @@ const REQUIRED_FILES: &[&str] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "voxcpm2-rs", about = "VoxCPM2 TTS CLI (Rust)")]
+#[command(name = "voxcpm2-rs", about = "VoxCPM2 TTS (Rust)")]
 struct Cli {
     #[arg(long, help = "Path to VoxCPM2 model directory")]
     model: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     Generate {
         #[arg(short, long, help = "Text to synthesize")]
@@ -85,7 +88,7 @@ enum Commands {
     ListVoices,
 }
 
-fn default_model_dir() -> Result<PathBuf> {
+pub fn default_model_dir() -> Result<PathBuf> {
     let base = dirs::data_local_dir()
         .or_else(dirs::data_dir)
         .ok_or_else(|| anyhow!("Cannot determine local data directory"))?;
@@ -126,7 +129,7 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_model(model_dir: &Path) -> Result<()> {
+pub fn ensure_model(model_dir: &Path) -> Result<()> {
     let missing = missing_files(model_dir);
     if missing.is_empty() {
         info!("Model files found in {}", model_dir.display());
@@ -138,7 +141,7 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
         let url = format!("{}/{}/resolve/main/{}", HF_BASE, MODEL_REPO, file);
         let dest = model_dir.join(file);
         match download_file(&url, &dest) {
-            Ok(()) => info!("  ✓ {}", file),
+            Ok(()) => info!("  done {}", file),
             Err(e) => {
                 let _ = std::fs::remove_file(&dest);
                 bail!("Failed to download {}: {}", file, e);
@@ -154,6 +157,13 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    match cli.command.clone() {
+        Some(cmd) => run_cli(&cli, cmd),
+        None => run_gui(),
+    }
+}
+
+fn run_cli(cli: &Cli, command: Commands) -> Result<()> {
     let model_path = match &cli.model {
         Some(p) => PathBuf::from(p),
         None => {
@@ -177,7 +187,7 @@ fn main() -> Result<()> {
     )?;
     info!("Model loaded, sample_rate: {}", engine.sample_rate());
 
-    match cli.command {
+    match command {
         Commands::Generate {
             text,
             output,
@@ -247,4 +257,14 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "gui")]
+fn run_gui() -> Result<()> {
+    crate::gui::run().map_err(|e| anyhow!("GUI error: {}", e))
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> Result<()> {
+    bail!("GUI mode not available. Compile with --features gui");
 }

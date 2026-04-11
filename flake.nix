@@ -30,12 +30,36 @@
         openssl
         cudaPackages.cudatoolkit
         cudaPackages.cudnn
+        alsa-lib
+        libGL
+        libxkbcommon
+        wayland
+        libx11
+        libxcursor
+        libxi
+        libxrandr
+        vulkan-loader
+        fontconfig
+        freetype
+        expat
       ];
 
       cudaLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
         cudaPackages.cudatoolkit.lib
         cudaPackages.cudnn.lib
         stdenv.cc.cc.lib
+        alsa-lib
+        libGL
+        vulkan-loader
+        wayland
+        libxkbcommon
+        libx11
+        libxcursor
+        libxi
+        libxrandr
+        fontconfig
+        freetype
+        expat
       ]) + ":/run/opengl-driver/lib";
 
       cudaLinkPath = pkgs.lib.makeLibraryPath [
@@ -61,17 +85,35 @@
 
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "voxcpm2-rs";
-        version = "0.3.0";
+        version = "0.4.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        cargoFeatures = [ "cuda" "gui" ];
 
-        nativeBuildInputs = with pkgs; [ pkg-config ];
-        buildInputs = with pkgs; [ openssl.out ];
+        nativeBuildInputs = with pkgs; [ pkg-config autoPatchelfHook ];
+        buildInputs = with pkgs; [
+          openssl.out
+          alsa-lib
+          libGL
+          libxkbcommon
+          wayland
+          libx11
+          libxcursor
+          libxi
+          libxrandr
+          vulkan-loader
+          fontconfig
+          freetype
+          expat
+          cudaPackages.cudatoolkit.lib
+          cudaPackages.cudnn.lib
+          stdenv.cc.cc.lib
+        ];
 
         LIBRARY_PATH = cudaLinkPath;
 
         meta = {
-          description = "VoxCPM2 TTS CLI tool (Rust)";
+          description = "VoxCPM2 TTS (Rust)";
           mainProgram = "voxcpm2-rs";
         };
       };
