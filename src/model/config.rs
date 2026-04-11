@@ -114,7 +114,16 @@ impl Default for InferenceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheMode {
+    Reference,
+    Continuation,
+    RefContinuation,
+}
+
 pub struct PromptCache {
+    pub mode: PromptCacheMode,
     pub text_token: Tensor,
     pub audio_feat: Tensor,
+    pub ref_audio_feat: Option<Tensor>,
 }

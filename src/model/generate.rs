@@ -112,9 +112,9 @@ impl VoxCPM2Engine {
     ) -> Result<()> {
         let name = name.into();
         info!("Registering voice preset: {}", name);
-        let cache = self
-            .voxcpm
-            .build_prompt_cache(prompt_text, prompt_wav_path.or(reference_wav_path))?;
+        let cache =
+            self.voxcpm
+                .build_prompt_cache(prompt_text, prompt_wav_path, reference_wav_path)?;
         self.voice_cache.insert(name, cache);
         Ok(())
     }
