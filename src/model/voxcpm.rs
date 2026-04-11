@@ -1,6 +1,6 @@
 use std::{cmp::max, f64};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias};
 use candle_transformers::models::deepseek2::SplitOp;
@@ -311,7 +311,9 @@ impl UnifiedCFM {
                 dt = t.sub(&t_span.i(step + 1)?)?;
             }
         }
-        Ok(sol.into_iter().last().unwrap())
+        sol.into_iter()
+            .last()
+            .ok_or_else(|| anyhow!("CFM produced no solution"))
     }
 }
 
