@@ -27,7 +27,7 @@ static FORMATS: &[(&str, FormatDef)] = &[
         FormatDef {
             codec: "libopus",
             container: "ogg",
-            content_type: "audio/opus",
+            content_type: "audio/ogg; codecs=opus",
         },
     ),
     (
@@ -139,7 +139,6 @@ fn decode_bytes(bytes: &[u8], device: &Device, target_sr: usize) -> Result<Tenso
         .to_str()
         .ok_or_else(|| anyhow!("temp path not utf-8"))?;
 
-    ffmpeg::init()?;
     let mut ictx = ffmpeg::format::input(path)?;
     let input_stream = ictx
         .streams()
@@ -240,23 +239,7 @@ fn send_audio_frame(
 }
 
 fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Result<Vec<u8>> {
-    let tmp_wav = tempfile::NamedTempFile::new()?;
-    {
-        let data = encode_wav_manual(samples, sample_rate)?;
-        std::fs::write(tmp_wav.path(), &data)?;
-    }
-
     let tmp_out = tempfile::NamedTempFile::new()?;
-
-    ffmpeg::init()?;
-    let mut ictx = ffmpeg::format::input(&tmp_wav.path())?;
-    let in_stream = ictx
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .ok_or_else(|| anyhow!("no audio stream in temp wav"))?;
-    let in_idx = in_stream.index();
-    let in_ctx = ffmpeg::codec::context::Context::from_parameters(in_stream.parameters())?;
-    let mut decoder = in_ctx.decoder().audio()?;
 
     let mut octx = ffmpeg::format::output(&tmp_out.path())?;
     let ocodec = ffmpeg::encoder::find_by_name(fmt.codec)
@@ -273,7 +256,7 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
     let mut encoder = enc_ctx.encoder().audio()?;
 
     let layout = ffmpeg::channel_layout::ChannelLayout::MONO;
-    let best_format =
+    let enc_format =
         audio_codec
             .formats()
             .and_then(|mut f| f.next())
@@ -283,7 +266,7 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
 
     encoder.set_rate(sample_rate as i32);
     encoder.set_channel_layout(layout);
-    encoder.set_format(best_format);
+    encoder.set_format(enc_format);
     encoder.set_time_base((1, sample_rate as i32));
     ostream.set_time_base((1, sample_rate as i32));
 
@@ -294,88 +277,22 @@ fn encode_via_ffmpeg(samples: &[f32], sample_rate: u32, fmt: &FormatDef) -> Resu
     let mut encoder = encoder.open_as(audio_codec)?;
     ostream.set_parameters(&encoder);
 
-    let mut resampler = ffmpeg::software::resampling::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        best_format,
-        layout,
-        sample_rate,
-    )?;
-
     let frame_size = encoder.frame_size().max(1) as usize;
 
     octx.write_header()?;
-
-    for (stream, packet) in ictx.packets() {
-        if stream.index() != in_idx {
-            continue;
-        }
-        decoder.send_packet(&packet)?;
-        let mut dframe = ffmpeg::util::frame::Audio::empty();
-        while decoder.receive_frame(&mut dframe).is_ok() {
-            let mut rframe = ffmpeg::util::frame::Audio::empty();
-            resampler.run(&dframe, &mut rframe)?;
-            let data = rframe.data(0);
-            let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-            let channels = rframe.channels() as usize;
-            let rfmt = rframe.format();
-            send_audio_frame(
-                &f32_data,
-                rfmt,
-                layout,
-                channels,
-                frame_size,
-                &mut encoder,
-                &mut octx,
-            )?;
-        }
-    }
-
-    decoder.send_eof()?;
-    let mut dframe = ffmpeg::util::frame::Audio::empty();
-    while decoder.receive_frame(&mut dframe).is_ok() {
-        let mut rframe = ffmpeg::util::frame::Audio::empty();
-        resampler.run(&dframe, &mut rframe)?;
-        let data = rframe.data(0);
-        let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-        let channels = rframe.channels() as usize;
-        let rfmt = rframe.format();
-        send_audio_frame(
-            &f32_data,
-            rfmt,
-            layout,
-            channels,
-            frame_size,
-            &mut encoder,
-            &mut octx,
-        )?;
-    }
-
-    {
-        let mut rframe = ffmpeg::util::frame::Audio::empty();
-        while resampler.flush(&mut rframe).is_ok() && rframe.samples() > 0 {
-            let data = rframe.data(0);
-            let f32_data: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-            let channels = rframe.channels() as usize;
-            let rfmt = rframe.format();
-            send_audio_frame(
-                &f32_data,
-                rfmt,
-                layout,
-                channels,
-                frame_size,
-                &mut encoder,
-                &mut octx,
-            )?;
-        }
-    }
-
+    send_audio_frame(
+        samples,
+        enc_format,
+        layout,
+        1,
+        frame_size,
+        &mut encoder,
+        &mut octx,
+    )?;
     encoder.send_eof()?;
     drain_encoder(&mut encoder, &mut octx)?;
     octx.write_trailer()?;
 
-    drop(tmp_wav);
     let result = std::fs::read(tmp_out.path())?;
     drop(tmp_out);
     Ok(result)

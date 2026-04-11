@@ -122,6 +122,7 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    ffmpeg_next::init()?;
 
     let args = Args::parse();
 
