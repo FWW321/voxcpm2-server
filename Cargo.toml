@@ -33,7 +33,11 @@ tempfile = "3"
 cuda = ["candle-nn/cuda", "candle-core/cuda", "candle-transformers/cuda"]
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 [lints.clippy]
 needless_range_loop = "allow"
