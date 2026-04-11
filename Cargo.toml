@@ -1,8 +1,8 @@
 [package]
-name = "voxcpm2-server"
-version = "0.2.0"
+name = "voxcpm2"
+version = "0.3.0"
 edition = "2024"
-description = "VoxCPM2 TTS inference server"
+description = "VoxCPM2 TTS CLI tool"
 
 [dependencies]
 candle-core = { version = "0.10" }
@@ -16,16 +16,12 @@ hound = "3.5"
 symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "isomp4", "aac"] }
 rayon = "1.11"
 clap = { version = "4", features = ["derive"] }
-axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
-tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 num = "0.4"
 url = "2"
 base64 = "0.22"
-reqwest = { version = "0.13", features = ["stream"] }
-futures-util = "0.3"
+reqwest = { version = "0.13", features = ["blocking"] }
 dirs = "6"
 
 [features]

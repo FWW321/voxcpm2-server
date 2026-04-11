@@ -32,10 +32,6 @@
         cudaPackages.cudnn
       ];
 
-      runtimeDeps = with pkgs; [
-        openssl.out
-      ];
-
       cudaLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
         cudaPackages.cudatoolkit.lib
         cudaPackages.cudnn.lib
@@ -57,105 +53,27 @@
         CPATH = "${pkgs.cudaPackages.cudatoolkit}/include";
 
         shellHook = ''
-          echo "voxcpm2-server dev shell"
+          echo "voxcpm2 dev shell"
           echo "rustc: $(rustc --version)"
           echo "cuda:  ${pkgs.cudaPackages.cudatoolkit.version}"
         '';
       };
 
       packages.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "voxcpm2-server";
-        version = "0.1.0";
+        pname = "voxcpm2";
+        version = "0.3.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
 
-        buildInputs = runtimeDeps;
         nativeBuildInputs = with pkgs; [ pkg-config ];
+        buildInputs = with pkgs; [ openssl.out ];
 
-        LIBRARY_PATH = cudaLibPath;
+        LIBRARY_PATH = cudaLinkPath;
 
         meta = {
-          description = "VoxCPM2 TTS inference server";
-          mainProgram = "voxcpm2-server";
+          description = "VoxCPM2 TTS CLI tool";
+          mainProgram = "voxcpm2";
         };
       };
-    })
-    // {
-      nixosModule = { config, lib, pkgs, ... }:
-    let
-      cfg = config.services.voxcpm2-server;
-    in
-    {
-      options.services.voxcpm2-server = {
-        enable = lib.mkEnableOption "VoxCPM2 TTS inference server";
-
-        package = lib.mkOption {
-          type = lib.types.package;
-          description = "VoxCPM2 server package";
-        };
-
-        host = lib.mkOption {
-          type = lib.types.str;
-          default = "0.0.0.0";
-          description = "Host to bind";
-        };
-
-        port = lib.mkOption {
-          type = lib.types.port;
-          default = 5800;
-          description = "Port to bind";
-        };
-
-        modelDir = lib.mkOption {
-          type = lib.types.path;
-          default = "/var/lib/voxcpm2-server/model";
-          description = "Path to VoxCPM2 model directory";
-        };
-
-        cudaLibPath = lib.mkOption {
-          type = lib.types.str;
-          description = "LD_LIBRARY_PATH for CUDA libraries";
-        };
-
-        user = lib.mkOption {
-          type = lib.types.str;
-          default = "voxcpm2-server";
-          description = "User to run the service as";
-        };
-
-        group = lib.mkOption {
-          type = lib.types.str;
-          default = "voxcpm2-server";
-          description = "Group to run the service as";
-        };
-      };
-
-      config = lib.mkIf cfg.enable {
-        users.users.${cfg.user} = {
-          isSystemUser = true;
-          group = cfg.group;
-          home = "/var/lib/voxcpm2-server";
-          createHome = true;
-        };
-        users.groups.${cfg.group} = {};
-
-        systemd.services.voxcpm2-server = {
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" ];
-          description = "VoxCPM2 TTS inference server";
-
-          serviceConfig = {
-            Type = "simple";
-            ExecStart = "${lib.getExe cfg.package} --model ${cfg.modelDir} --host ${cfg.host} --port ${toString cfg.port}";
-            Restart = "on-failure";
-            RestartSec = 5;
-            User = cfg.user;
-            Group = cfg.group;
-            Environment = lib.optionalString (cfg.cudaLibPath != "") "LD_LIBRARY_PATH=${cfg.cudaLibPath}";
-            WorkingDirectory = "/var/lib/voxcpm2-server";
-          };
-        };
-      };
-    };
-  };
+    });
 }

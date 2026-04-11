@@ -1,8 +1,8 @@
 use std::{cmp::max, f64};
 
-use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
+use anyhow::{Result, anyhow};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias};
 use candle_transformers::models::deepseek2::SplitOp;
 
 use crate::{

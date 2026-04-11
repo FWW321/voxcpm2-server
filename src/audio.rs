@@ -79,15 +79,11 @@ pub fn decode(path: &str, device: &Device, target_sr: usize) -> Result<Tensor> {
 }
 
 fn download_audio(url: &str) -> Result<Vec<u8>> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let resp = reqwest::get(url).await?;
-            if !resp.status().is_success() {
-                bail!("HTTP download failed: {}", resp.status());
-            }
-            Ok(resp.bytes().await?.to_vec())
-        })
-    })
+    let resp = reqwest::blocking::get(url)?;
+    if !resp.status().is_success() {
+        bail!("HTTP download failed: {}", resp.status());
+    }
+    Ok(resp.bytes()?.to_vec())
 }
 
 fn decode_symphonia(bytes: &[u8], device: &Device) -> Result<(Tensor, usize)> {

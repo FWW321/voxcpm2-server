@@ -123,6 +123,7 @@ impl VoxCPM2Engine {
         self.voice_cache.keys().collect()
     }
 
+    #[allow(dead_code)]
     pub fn remove_voice(&mut self, name: &str) -> bool {
         self.voice_cache.remove(name).is_some()
     }

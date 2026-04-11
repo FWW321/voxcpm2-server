@@ -1,18 +1,15 @@
 mod audio;
 mod model;
 mod nn;
-mod server;
 mod utils;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use clap::Parser;
-use tracing::{Level, info, warn};
+use clap::{Parser, Subcommand};
+use tracing::{Level, info};
 
-use crate::model::generate::VoxCPM2Engine;
-use crate::server::{AppState, create_router};
+use crate::model::generate::{GenerateRequest, VoxCPM2Engine};
 
 const MODEL_REPO: &str = "openbmb/VoxCPM2";
 const HF_BASE: &str = "https://huggingface.co";
@@ -24,17 +21,68 @@ const REQUIRED_FILES: &[&str] = &[
     "tokenizer.json",
 ];
 
-#[derive(Parser, Debug)]
-#[command(name = "voxcpm2-server", about = "VoxCPM2 TTS inference server")]
-struct Args {
-    #[arg(short, long, help = "Path to VoxCPM2 model directory")]
+#[derive(Parser)]
+#[command(name = "voxcpm2", about = "VoxCPM2 TTS CLI")]
+struct Cli {
+    #[arg(long, help = "Path to VoxCPM2 model directory")]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.0.0.0", help = "Host to bind")]
-    host: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    #[arg(short, long, default_value_t = 5800, help = "Port to bind")]
-    port: u16,
+#[derive(Subcommand)]
+enum Commands {
+    Generate {
+        #[arg(short, long, help = "Text to synthesize")]
+        text: String,
+
+        #[arg(short, long, help = "Output WAV file path")]
+        output: String,
+
+        #[arg(long, help = "Voice name (must be registered first)")]
+        voice: Option<String>,
+
+        #[arg(long, help = "Prompt text for cloning")]
+        prompt_text: Option<String>,
+
+        #[arg(long, help = "Prompt audio file path")]
+        prompt_wav: Option<String>,
+
+        #[arg(long, help = "Reference audio file path (controllable cloning)")]
+        reference_wav: Option<String>,
+
+        #[arg(long, help = "Control instruction, e.g. '(gentle female voice)'")]
+        control_instruction: Option<String>,
+
+        #[arg(long, default_value_t = 10, help = "Inference timesteps")]
+        inference_timesteps: usize,
+
+        #[arg(long, default_value_t = 2.0, help = "CFG value")]
+        cfg_value: f64,
+
+        #[arg(long, default_value_t = 2, help = "Min generation length")]
+        min_len: usize,
+
+        #[arg(long, default_value_t = 4096, help = "Max generation length")]
+        max_len: usize,
+    },
+
+    RegisterVoice {
+        #[arg(long, help = "Voice name")]
+        name: String,
+
+        #[arg(long, help = "Prompt text (transcript of prompt audio)")]
+        prompt_text: Option<String>,
+
+        #[arg(long, help = "Prompt audio file path")]
+        prompt_wav: Option<String>,
+
+        #[arg(long, help = "Reference audio file path")]
+        reference_wav: Option<String>,
+    },
+
+    ListVoices,
 }
 
 fn default_model_dir() -> Result<PathBuf> {
@@ -55,9 +103,7 @@ fn missing_files(model_dir: &Path) -> Vec<&'static str> {
 fn download_file(url: &str, dest: &Path) -> Result<()> {
     use std::io::Write;
     info!("Downloading {}", url);
-    let resp = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async { reqwest::get(url).await })
-    })?;
+    let resp = reqwest::blocking::Client::new().get(url).send()?;
     if !resp.status().is_success() {
         bail!("Download failed: HTTP {}", resp.status());
     }
@@ -66,30 +112,17 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::File::create(dest)?;
-    let mut downloaded: u64 = 0;
-    let body = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            use futures_util::StreamExt;
-            let mut buf = Vec::new();
-            let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                buf.extend_from_slice(&chunk);
-            }
-            Ok::<Vec<u8>, anyhow::Error>(buf)
-        })
-    })?;
+    let body = resp.bytes()?;
     for chunk in body.chunks(8192) {
         file.write_all(chunk)?;
-        downloaded += chunk.len() as u64;
-        if let Some(total) = total {
-            let pct = downloaded as f64 / total as f64 * 100.0;
-            let mb_dl = downloaded as f64 / 1_048_576.0;
-            let mb_total = total as f64 / 1_048_576.0;
-            eprint!("\r  {:.1}/{:.1} MB ({:.1}%)", mb_dl, mb_total, pct);
-        }
     }
-    println!();
+    if let Some(total) = total {
+        info!(
+            "  {:.1}/{:.1} MB",
+            body.len() as f64 / 1_048_576.0,
+            total as f64 / 1_048_576.0
+        );
+    }
     Ok(())
 }
 
@@ -99,10 +132,8 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
         info!("Model files found in {}", model_dir.display());
         return Ok(());
     }
-
     info!("Missing model files: {:?}", missing);
     info!("Downloading from HuggingFace ({})...", MODEL_REPO);
-
     for file in &missing {
         let url = format!("{}/{}/resolve/main/{}", HF_BASE, MODEL_REPO, file);
         let dest = model_dir.join(file);
@@ -114,18 +145,16 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
             }
         }
     }
-
     info!("All model files downloaded to {}", model_dir.display());
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    let model_path = match &args.model {
+    let model_path = match &cli.model {
         Some(p) => PathBuf::from(p),
         None => {
             let dir = default_model_dir()?;
@@ -138,56 +167,84 @@ async fn main() -> Result<()> {
 
     ensure_model(&model_path)?;
 
-    info!("Loading VoxCPM2 model from: {}", model_path.display());
-    let model_str = model_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Model path contains non-UTF-8 characters"))?
-        .to_string();
-    let engine =
-        tokio::task::spawn_blocking(move || VoxCPM2Engine::init(&model_str, None, None)).await??;
+    info!("Loading model from: {}", model_path.display());
+    let mut engine = VoxCPM2Engine::init(
+        model_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid model path"))?,
+        None,
+        None,
+    )?;
     info!("Model loaded, sample_rate: {}", engine.sample_rate());
 
-    let state = Arc::new(AppState {
-        engine: std::sync::Mutex::new(engine),
-    });
-
-    let app = create_router(state);
-    let addr = format!("{}:{}", args.host, args.port);
-    info!("Starting server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Server listening on {}", addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match cli.command {
+        Commands::Generate {
+            text,
+            output,
+            voice,
+            prompt_text,
+            prompt_wav,
+            reference_wav,
+            control_instruction,
+            inference_timesteps,
+            cfg_value,
+            min_len,
+            max_len,
+        } => {
+            let config = crate::model::config::InferenceConfig {
+                min_len,
+                max_len,
+                inference_timesteps,
+                cfg_value,
+                ..Default::default()
+            };
+            let audio_tensor = engine.generate(GenerateRequest {
+                text: &text,
+                prompt_text: prompt_text.as_deref(),
+                prompt_wav_path: prompt_wav.as_deref(),
+                reference_wav_path: reference_wav.as_deref(),
+                control_instruction,
+                voice,
+                config: &config,
+            })?;
+            let sr = engine.sample_rate() as u32;
+            let wav_bytes = crate::audio::encode_wav(&audio_tensor, sr)?;
+            std::fs::write(&output, &wav_bytes)?;
+            info!(
+                "Written {} ({:.1} KB) to {}",
+                text,
+                wav_bytes.len() as f64 / 1024.0,
+                output
+            );
+        }
+        Commands::RegisterVoice {
+            name,
+            prompt_text,
+            prompt_wav,
+            reference_wav,
+        } => {
+            if prompt_wav.is_none() && reference_wav.is_none() {
+                bail!("At least one of --prompt-wav or --reference-wav is required");
+            }
+            engine.register_voice(
+                &name,
+                prompt_text.as_deref(),
+                prompt_wav.as_deref(),
+                reference_wav.as_deref(),
+            )?;
+            info!("Voice '{}' registered", name);
+        }
+        Commands::ListVoices => {
+            let voices = engine.list_voices();
+            if voices.is_empty() {
+                println!("No voices registered.");
+            } else {
+                for name in voices {
+                    println!("  {}", name);
+                }
+            }
+        }
+    }
 
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            warn!("failed to listen for ctrl+c");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(e) => {
-                warn!("failed to listen for SIGTERM: {e}");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => info!("Received Ctrl+C, shutting down"),
-        _ = terminate => info!("Received SIGTERM, shutting down"),
-    }
 }
